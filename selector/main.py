@@ -38,6 +38,7 @@ CHILD_LIMIT_S = float(os.environ.get("BLAST_CHILD_LIMIT", "60"))
 # The scorer allows 3 minutes for the whole batch (4.5 in the final). Stop verifying well before.
 DEADLINE = time.monotonic() + float(os.environ.get("BLAST_BUDGET_S", "130"))
 WORKER_COST_MS = 2000
+MAX_NODES_N = None
 
 
 def log(*a):
@@ -854,6 +855,8 @@ def main() -> None:
         plans.append(plan_commit(c, text, maps, tests))
     log(f"planned {len(plans)} commits in {time.time()-t0:.2f}s")
 
+    global MAX_NODES_N
+    MAX_NODES_N = ids.index("tests/test_parser.py::TestParser::test_max_nodes")         if "tests/test_parser.py::TestParser::test_max_nodes" in ids else None
     cpu_cost = _load_cpu_costs(ids, dur_ms)
     pfail = _load_pfail(ids)
     results: dict[str, set[int]] = {}
@@ -864,6 +867,11 @@ def main() -> None:
             cheap = []
         else:
             plan_partials(p, maps, cpu_cost)
+            # test_max_nodes can be verified at a smaller scale (runner._max_nodes_scaled) unless
+            # the patch edits the test itself
+            p.scaled = not any(k.endswith("/tests/test_parser.py") for k in p.patched)
+            if p.scaled and MAX_NODES_N is not None:
+                p.cost_override[MAX_NODES_N] = 1.2
             verify, listed = choose_verify(p.candidates, dur_ms, _Costs(cpu_cost, p.cost_override), pfail)
             p.listed = listed
             cheap = sorted(verify)
@@ -1075,11 +1083,14 @@ def _run_jobs(jobs, ids, dur_ms, results):
                 try:
                     from runner import run_tests
                     timeouts = {ids[n]: max(1.0, 5 * dur_ms[n] / 1000) for n in cheap}
+                    if getattr(plan, "scaled", False) and MAX_NODES_N in cheap:
+                        # ~0.7 s normally; a big slowdown would make the full test time out
+                        timeouts[ids[MAX_NODES_N]] = 10.0
                     import resource as _r
                     stats = {}
                     failed = run_tests(SRC, [ids[n] for n in cheap], plan.patched, timeouts, stats,
                                        case_filter=getattr(plan, "case_filter", None),
-                                       hotswap=plan.hotswap)
+                                       hotswap=plan.hotswap, scaled=getattr(plan, "scaled", False))
                     ru = _r.getrusage(_r.RUSAGE_SELF)
                     stats["cpu"] = round(ru.ru_utime + ru.ru_stime, 3)
                     payload = json.dumps({"failed": sorted(failed), "stats": stats}).encode()

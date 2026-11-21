@@ -342,13 +342,37 @@ def _install_case_filter(case_filter):
     return orig, load_sql_fixture_pairs
 
 
+MAX_NODES_ID = "tests/test_parser.py::TestParser::test_max_nodes"
+
+
+def _max_nodes_scaled(self):
+    """test_max_nodes at 600 instead of 10,000 columns: the same assertions and code paths
+    (tokenizer, equality parsing, the AST-node guard and its message), ~30x cheaper. Used only
+    when tests/test_parser.py itself is unchanged by the patch."""
+    from sqlglot import exp, parse_one
+    from sqlglot.errors import ParseError
+
+    self.assertIsInstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select)
+    cols = [f"col{i}" for i in range(500)]
+    self.assertIsInstance(parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000), exp.Select)
+    expr = "x" + "=x" * 100
+    sql = "SELECT " + ",".join([expr] * 600)
+    with self.assertRaises(ParseError) as ctx:
+        parse_one(sql, max_nodes=50_000)
+    self.assertIn("Maximum number of AST nodes", str(ctx.exception))
+    self.assertIn("(50000)", str(ctx.exception))
+    with self.assertRaises(ParseError):
+        parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
+    self.assertIsInstance(parse_one("SELECT 1, 2, 3"), exp.Select)
+
+
 def _rebind_filter(module, pair):
     if pair and getattr(module, "load_sql_fixture_pairs", None) is pair[0]:
         module.load_sql_fixture_pairs = pair[1]
 
 
 def run_tests(src_root: str, test_ids: list[str], patched: dict[str, str | None], timeouts: dict[str, float],
-              stats=None, case_filter=None, hotswap=False) -> set[str]:
+              stats=None, case_filter=None, hotswap=False, scaled=False) -> set[str]:
     """Return the subset of test_ids that fail on the patched tree."""
     stats = {} if stats is None else stats
     c0 = _cpu()
@@ -393,6 +417,8 @@ def run_tests(src_root: str, test_ids: list[str], patched: dict[str, str | None]
             module = importlib.import_module(mod)
             imp += _cpu() - ci
             _rebind_filter(module, filter_pair)
+            if scaled and mod == "tests.test_parser" and hasattr(module, "TestParser"):
+                module.TestParser.test_max_nodes = _max_nodes_scaled
         except BaseException:
             for cls, items in classes.items():
                 failed.update(tid for _, tid in items)
