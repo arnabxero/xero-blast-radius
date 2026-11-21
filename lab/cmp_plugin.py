@@ -108,6 +108,29 @@ class _Finder(importlib.abc.MetaPathFinder):
 
 sys.meta_path.insert(0, _Finder())
 
+# Optional per-case run (same convention as trace_plugin): CMP_CASE=BASE or "<fixture>|<k>"
+_CASE = os.environ.get("CMP_CASE")
+
+
+def _wrap_loader(orig):
+    def loader(filename, *args, **kwargs):
+        if _CASE == "BASE":
+            return
+        f, k = _CASE.rsplit("|", 1)
+        if filename != f:
+            return
+        for i, item in enumerate(orig(filename, *args, **kwargs)):
+            if i == int(k):
+                yield item
+
+    return loader
+
+
+if _CASE:
+    import tests.helpers as _helpers  # imported before the test modules bind the loaders
+
+    _helpers.load_sql_fixture_pairs = _wrap_loader(_helpers.load_sql_fixture_pairs)
+
 
 def pytest_sessionfinish(session, exitstatus):
     if OUT:

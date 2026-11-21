@@ -288,6 +288,7 @@ def hot_swap(src_root: str, path: str, new_text: str) -> bool:
             by_pos[pos] = None  # ambiguous (e.g. two lambdas on one line)
         else:
             by_pos[pos] = key
+    gc.unfreeze()  # the parent froze its heap; get_objects() does not see the frozen generation
     swaps = []
     for f in gc.get_objects():
         if type(f) is not types.FunctionType:
@@ -302,6 +303,8 @@ def hot_swap(src_root: str, path: str, new_text: str) -> bool:
         if new.co_freevars != code.co_freevars:
             return False
         swaps.append((f, new))
+    if not swaps and any(k[0] != "<module>" and not k[0].endswith(">") or "<lambda>" in k[0] for k in old_k):
+        return False  # a loaded module whose functions cannot be found: never verify stale code
     for f, new in swaps:
         f.__code__ = new
     return True
@@ -311,6 +314,7 @@ def _clear_caches():
     import functools
     import gc
 
+    gc.unfreeze()
     for o in gc.get_objects():
         if isinstance(o, functools._lru_cache_wrapper):
             try:

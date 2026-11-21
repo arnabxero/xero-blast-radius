@@ -79,6 +79,8 @@ class Maps:
         self.lambda_tests = d.get("lambda_tests", {})
         self.lambdas_traced = bool(d.get("lambdas_traced"))
         self.cmp_ok = set(d.get("cmp_ok", []))
+        self.name_uses = d.get("name_uses", {})
+        self.name_unsafe = set(d.get("name_unsafe", []))
         # case maps share line_sets but hold case-unit ids, not test numbers: unusable after a remap
         cases = (d.get("cases") or {}) if self._remap is None else {}
         self.case_units = cases.get("units", [])
@@ -599,7 +601,12 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
     for q in class_quals:
         hit |= maps.instance_tests(q)
     if module_level:
-        hit |= maps.module_tests(rel)
+        narrowed = _module_constant_tests(fp, old_text, new_text, rel, maps)
+        if narrowed is None:
+            hit |= maps.module_tests(rel)
+        else:
+            hit |= narrowed
+            plan.notes.append(f"{rel}: module constant(s), {len(narrowed)} readers")
     plan.cand_other |= hit
     plan.cand_spans |= span_hit
     hit |= span_hit
@@ -649,6 +656,72 @@ def _only_equivalent_swaps(fp: FilePatch, old_text: str, new_text: str, rel: str
         if f"{rel}:{c.lineno}:{c.col_offset}:{kinds[0]}" not in cmp_ok:
             return False
     return True
+
+
+def _module_constant_tests(fp: FilePatch, old_text: str, new_text: str, rel: str, maps: Maps):
+    """Tests that read a module-level constant changed by this file patch, or None if the change
+    is anything other than edits to module-level `NAME = ...` assignments whose values are only
+    read at runtime (inside functions), never at import time, never via aliases or strings."""
+    if not maps.name_uses:
+        return None
+    try:
+        t_old, t_new = ast.parse(old_text), ast.parse(new_text)
+    except SyntaxError:
+        return None
+    old_l, new_l = old_text.split("\n"), new_text.split("\n")
+
+    def assign_names(tree, ln, text_lines):
+        for node in tree.body:
+            if node.lineno <= ln <= (node.end_lineno or node.lineno):
+                if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                    tg = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    if all(isinstance(t, ast.Name) for t in tg):
+                        return {t.id for t in tg}, (node.lineno, node.end_lineno or node.lineno)
+                return None, None  # some other kind of statement changed
+        s = text_lines[ln - 1].strip() if 0 < ln <= len(text_lines) else ""
+        return (set(), None) if (not s or s.startswith("#")) else (None, None)
+
+    names: set[str] = set()
+    own_spans = []
+    o_line = n_line = 0
+    for h in fp.hunks:
+        o = h.old_start if h.old_len > 0 else h.old_start + 1
+        n = h.new_start if h.new_len > 0 else h.new_start + 1
+        for l in h.lines:
+            t = l[:1]
+            if t == " ":
+                o += 1
+                n += 1
+            elif t == "-":
+                got, span = assign_names(t_old, o, old_l)
+                if got is None:
+                    return None
+                names |= got
+                if span:
+                    own_spans.append(span)
+                o += 1
+            elif t == "+":
+                got, _span = assign_names(t_new, n, new_l)
+                if got is None:
+                    return None
+                names |= got
+                n += 1
+    if not names:
+        return None
+    hit: set[int] = set()
+    for name in names:
+        if name in maps.name_unsafe or name not in maps.name_uses:
+            return None
+        u = maps.name_uses[name]
+        for f, lines in u.get("it", {}).items():
+            for ln in lines:
+                if f == rel and any(a <= ln <= b for a, b in own_spans):
+                    continue  # the changed assignment itself
+                return None  # read at import time: something derives from it
+        for f, spans in u.get("rt", {}).items():
+            for a, b in spans:
+                hit |= maps.lines_in_range(f, a, b)
+    return hit
 
 
 def _pair_lines(fp: FilePatch):
@@ -782,6 +855,7 @@ def main() -> None:
     log(f"planned {len(plans)} commits in {time.time()-t0:.2f}s")
 
     cpu_cost = _load_cpu_costs(ids, dur_ms)
+    pfail = _load_pfail(ids)
     results: dict[str, set[int]] = {}
     jobs = []
     for p in plans:
@@ -790,7 +864,7 @@ def main() -> None:
             cheap = []
         else:
             plan_partials(p, maps, cpu_cost)
-            verify, listed = choose_verify(p.candidates, dur_ms, _Costs(cpu_cost, p.cost_override))
+            verify, listed = choose_verify(p.candidates, dur_ms, _Costs(cpu_cost, p.cost_override), pfail)
             p.listed = listed
             cheap = sorted(verify)
             p.case_filter = _case_filter(p, set(cheap), maps)
@@ -811,6 +885,17 @@ def main() -> None:
     me, ch = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
     cpu = me.ru_utime + me.ru_stime + ch.ru_utime + ch.ru_stime
     log(f"total {time.time()-t0:.2f}s wall, cpu {cpu:.2f}s (self+children)")
+
+
+def _load_pfail(ids):
+    try:
+        with open(os.path.join(os.path.dirname(MAPS), "pfail.json")) as fh:
+            d = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    default, per = d.get("default", P_FAIL), d.get("tests", {})
+    probs = [per.get(t, default) for t in ids]
+    return lambda n: probs[n]
 
 
 class _Costs:
@@ -879,12 +964,22 @@ def _load_cpu_costs(ids, dur_ms) -> list[float]:
     return out
 
 
-def choose_verify(cands: set[int], dur_ms: list[int], cpu: list[float]):
-    """Split candidates into (run them to find out, list them without running)."""
+def choose_verify(cands: set[int], dur_ms: list[int], cpu, pf=None):
+    """Split candidates into (run them to find out, list them without running).
+
+    Running a test costs its CPU time; if it then fails it is listed as well. Listing costs its
+    recorded time on some worker (+2 s if it needs a worker of its own). pf(n) is a prior chance
+    that candidate n actually fails (measured on synthetic patches); it only steers this choice:
+    whatever runs is verified, so it can never cause a miss.
+    """
     if not cands:
         return set(), set()
-    MAX_RUN_S = 8.0
-    must_list = {n for n in cands if cpu[n] > MAX_RUN_S or cpu[n] > dur_ms[n] / 1000 + 2.0}
+    pf = pf or (lambda n: P_FAIL)
+    MAX_RUN_S = 25.0  # keep any single verification well inside the batch time limit
+    d = [x / 1000 for x in dur_ms]
+    # expensive runs need a clear expected win (they are high-variance: run AND list if it fails)
+    must_list = {n for n in cands if cpu[n] > MAX_RUN_S
+                 or cpu[n] + pf(n) * d[n] > (0.8 if cpu[n] > 2.0 else 1.0) * (d[n] + 2.0)}
     rest = cands - must_list
     if must_list:
         # the 2 s worker fee is paid anyway: list whatever is cheaper to list than to run,
@@ -898,15 +993,18 @@ def choose_verify(cands: set[int], dur_ms: list[int], cpu: list[float]):
             new_max = max(cur_max, loads[i] + dur_ms[n])
             marginal = (new_max - cur_max) / 1000
             # list it when that is free (fits under the busiest worker) or cheaper than running it
-            if marginal <= 0 or marginal <= cpu[n] * (1 - P_FAIL):
+            if marginal <= 0 or marginal <= cpu[n] * (1 - pf(n)):
                 loads[i] += dur_ms[n]
                 cur_max = new_max
                 listed.add(n)
         return rest - listed, listed
-    # nothing must be listed: either run everything, or list everything without running
-    run_cost = sum(cpu[n] for n in rest)
+    # nothing must be listed: run everything, or list everything without running
+    p_none = 1.0
+    for n in rest:
+        p_none *= 1 - pf(n)
+    run_cost = sum(cpu[n] for n in rest) + (1 - p_none) * 2.5
     list_cost = _pack_cost(split_workers(sorted(rest), dur_ms), dur_ms) / 1000
-    if list_cost <= run_cost + P_FAIL * 2.0 and len(rest) <= 3:
+    if list_cost <= run_cost:
         return set(), set(rest)
     return set(rest), set()
 
@@ -939,6 +1037,12 @@ def _preload(test_modules=()):
             importlib.import_module(m)
         except Exception as e:  # the child re-imports and reports it properly
             log(f"preload {m} failed: {e!r}")
+    # Move everything imported so far into the permanent GC generation: forked children then
+    # never re-scan (or copy-on-write touch) the parent's objects during garbage collection.
+    import gc
+
+    gc.collect()
+    gc.freeze()
 
 
 def _run_jobs(jobs, ids, dur_ms, results):

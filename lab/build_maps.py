@@ -20,6 +20,82 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+def _name_uses(src: str):
+    """Where each module-level name of sqlglot is READ, split into runtime and import-time reads.
+
+    Returns ({name: {"rt": {file: [[start, end], ...]}, "it": {file: [line, ...]}}}, unsafe_names).
+    rt spans are the enclosing statement of each read inside a function/lambda body; "it" are reads
+    executed at import time (module or class level). Names that are imported under an alias or
+    appear as string constants (getattr/globals) are unsafe to narrow.
+    """
+    import ast
+
+    files = []
+    for top in ("sqlglot", "tests"):
+        for root, _, fs in os.walk(os.path.join(src, top)):
+            files += [os.path.join(root, f) for f in fs if f.endswith(".py")]
+    trees = {}
+    for path in files:
+        rel = os.path.relpath(path, src).replace(os.sep, "/")
+        try:
+            trees[rel] = ast.parse(open(path, encoding="utf-8").read())
+        except SyntaxError:
+            pass
+    targets, unsafe = set(), set()
+    for rel, tree in trees.items():
+        if rel.startswith("sqlglot/"):
+            for node in tree.body:
+                tg = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign)) else []
+                for t in tg:
+                    for n in ast.walk(t):
+                        if isinstance(n, ast.Name):
+                            targets.add(n.id)
+    for rel, tree in trees.items():
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.ImportFrom, ast.Import)):
+                for a in node.names:
+                    if a.asname and a.asname != a.name.split(".")[-1]:
+                        unsafe.add(a.name.split(".")[-1])
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in targets:
+                unsafe.add(node.value)
+    uses: dict = {}
+    for rel, tree in trees.items():
+        regions = []
+        stmts = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
+                regions.append((node.body[0].lineno, node.end_lineno))
+            elif isinstance(node, ast.Lambda):
+                regions.append((node.body.lineno, node.body.end_lineno))
+            if isinstance(node, ast.stmt):
+                body = getattr(node, "body", None)
+                if isinstance(body, list) and body and isinstance(body[0], ast.stmt):
+                    stmts.append((node.lineno, max(node.lineno, body[0].lineno - 1)))
+                else:
+                    stmts.append((node.lineno, node.end_lineno))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                ident = node.id
+            elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+                ident = node.attr
+            else:
+                continue
+            if ident not in targets:
+                continue
+            ln = node.lineno
+            rt = any(a <= ln <= b for a, b in regions)
+            ent = uses.setdefault(ident, {"rt": {}, "it": {}})
+            if rt:
+                span = min((sp for sp in stmts if sp[0] <= ln <= sp[1]), key=lambda sp: sp[1] - sp[0], default=(ln, ln))
+                ent["rt"].setdefault(rel, set()).add(span)
+            else:
+                ent["it"].setdefault(rel, set()).add(ln)
+    out = {n: {"rt": {f: sorted(list(x) for x in v) for f, v in e["rt"].items()},
+               "it": {f: sorted(v) for f, v in e["it"].items()}} for n, e in uses.items()}
+    print(f"name_uses: names={len(out)} unsafe={len(unsafe)}", file=sys.stderr)
+    return out, sorted(unsafe)
+
+
 def _cmp_ok(cmp_dir: str) -> list[str]:
     """Comparison sites where `is` and `==` (or `is not` and `!=`) never disagreed (lab/cmp_plugin.py)."""
     stats: dict[str, list[int]] = {}
@@ -149,6 +225,9 @@ def main(trace_dir: str, tests_json: str, out_path: str, case_dir: str | None = 
     }
     if case_dir:
         out["cases"] = _case_maps(case_dir, intern)
+    src_dir = os.environ.get("SRC_DIR")
+    if src_dir:
+        out["name_uses"], out["name_unsafe"] = _name_uses(src_dir)
     cmp_dir = os.environ.get("CMP_DIR")
     if cmp_dir:
         out["cmp_ok"] = _cmp_ok(cmp_dir)
