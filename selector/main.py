@@ -1132,7 +1132,10 @@ def main() -> None:
             cheap = sorted(verify)
             p.case_filter = _case_filter(p, set(cheap), maps)
         except Exception as e:
-            p.listed, cheap, p.probe = set(p.candidates), [], set()
+            p.listed, cheap = set(p.candidates), []
+            if p.probe:
+                p.listed |= set(range(len(maps.test_ids)))
+            p.probe = set()
             p.notes.append(f"setup error {e!r}: listing all candidates")
         if cheap or (p.probe and not p.fallback):
             jobs.append((p, cheap))
@@ -1150,7 +1153,7 @@ def main() -> None:
             log(f"run error {e!r}: listing every unverified candidate")
             for p, cheap in jobs:
                 if p.commit not in results:
-                    results[p.commit] = set(getattr(p, "listed", set())) | set(cheap)
+                    results[p.commit] = _unverified(p, cheap)
 
     for p in plans:
         sel = sorted(results.get(p.commit, set(getattr(p, "listed", p.candidates))))
@@ -1337,7 +1340,7 @@ def _run_jobs(jobs, ids, dur_ms, results):
         # global wall-clock budget: past it, stop verifying and list every remaining candidate
         if pending and time.monotonic() > DEADLINE:
             for plan, cheap in pending:
-                results[plan.commit] = set(plan.listed) | set(cheap)
+                results[plan.commit] = _unverified(plan, cheap)
                 plan.notes.append("deadline: listing all")
             pending = []
         while pending and len(running) < PARALLEL:
@@ -1404,7 +1407,7 @@ def _run_jobs(jobs, ids, dur_ms, results):
                                   f"mode {st.get('mode')} cases {st.get('case_filter')} "
                                   f"probe {len(plan.probe)}/{st.get('probe_cpu')}]")
             else:
-                results[plan.commit] = set(plan.listed) | set(cheap)
+                results[plan.commit] = _unverified(plan, cheap)
                 plan.notes.append(f"child error {data!r}: listing all {len(cheap)}")
         # enforce time limits
         now = time.time()
@@ -1417,11 +1420,23 @@ def _run_jobs(jobs, ids, dur_ms, results):
                 os.waitpid(pid, 0)
                 os.close(fd)
                 running.pop(pid)
-                results[plan.commit] = set(plan.listed) | set(cheap)
+                results[plan.commit] = _unverified(plan, cheap)
                 plan.notes.append("child timeout: listing all")
 
 
 _PRINTED: set[str] = set()
+
+
+def _unverified(plan, cheap) -> set[int]:
+    """What to list when a commit's verification never completed (deadline, crashed or timed-out
+    child): its candidates, plus, if it needed an import probe, every test that the probed
+    modules failing to import would take down (the probe's answer is unknown)."""
+    out = set(getattr(plan, "listed", set())) | set(cheap)
+    if getattr(plan, "probe", None) and MAPS_OBJ is not None:
+        # an import failure can reach tests through modules that import the probed ones
+        # indirectly (the probe's full sweep finds those); without its answer, list everything
+        out |= set(range(len(MAPS_OBJ.test_ids)))
+    return out
 
 
 def _emit(commit: str, workers) -> None:
