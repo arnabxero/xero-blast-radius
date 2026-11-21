@@ -86,12 +86,16 @@ class Maps:
         self.imp_lines: dict = {}
         self.collect: dict[str, set[str]] = {}
         self.imp_names: dict = {}
+        self.cattr_reads: dict = {}
+        self.sql_at_import: set[str] = set()
         try:
             with gzip.open(os.path.join(os.path.dirname(path), "imports.json.gz"), "rt") as fh:
                 di = json.load(fh)
             self.imp_mods, self.imp_lines = di["modules"], di["lines"]
             self.collect = {f: set(v) for f, v in di["collect"].items()}
             self.imp_names = di.get("names", {})
+            self.cattr_reads = di.get("cattr_reads", {})
+            self.sql_at_import = set(di.get("sql_at_import", []))
         except (OSError, ValueError, KeyError):
             pass
         self.lambdas_traced = bool(d.get("lambdas_traced"))
@@ -217,6 +221,22 @@ class Maps:
         return out
 
 
+def _docstrings_only(old_text: str, new_text: str) -> bool:
+    """True if the two sources differ only in docstrings (and comments/layout)."""
+    def strip(text):
+        tree = ast.parse(text)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                b = node.body
+                if b and isinstance(b[0], ast.Expr) and isinstance(b[0].value, ast.Constant)                         and isinstance(b[0].value.value, str):
+                    node.body = b[1:] or [ast.Pass()]
+        return ast.dump(tree)
+    try:
+        return strip(old_text) == strip(new_text)
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+
+
 def _bindings(tree) -> set[str]:
     """Names bound at module level or in class bodies (imports, defs, classes, assignments)."""
     out: set[str] = set()
@@ -250,6 +270,58 @@ def _bindings(tree) -> set[str]:
                     walk(hnd.body)
 
     walk(tree.body)
+    return out
+
+
+def _class_attr_changes(old_tree, new_tree, safe) -> dict[str, set[str]]:
+    """class qualname -> attribute names, for classes whose body (methods aside) differs between
+    the two trees only in the values of `NAME = ...` assignments to attributes in `safe` (data
+    attributes read only at run time). Classes with any other kind of body change are absent."""
+    if old_tree is None or new_tree is None:
+        return {}
+
+    def classes(tree):
+        out = {}
+
+        def walk(body, chain):
+            for node in body:
+                if isinstance(node, ast.ClassDef):
+                    q = ".".join(chain + [node.name])
+                    out[q] = node
+                    walk(node.body, chain + [node.name])
+        walk(tree.body, [])
+        return out
+
+    def target(st):
+        tg = st.targets if isinstance(st, ast.Assign) else [st.target] if isinstance(st, ast.AnnAssign) else []
+        return tg[0].id if len(tg) == 1 and isinstance(tg[0], ast.Name) else None
+
+    def header(c):
+        return ast.dump(ast.ClassDef(name=c.name, bases=c.bases, keywords=c.keywords, body=[],
+                                     decorator_list=c.decorator_list, type_params=[]))
+
+    old_c, new_c = classes(old_tree), classes(new_tree)
+    out: dict[str, set[str]] = {}
+    for q, oc in old_c.items():
+        nc = new_c.get(q)
+        if nc is None or header(oc) != header(nc):
+            continue
+        ob = [st for st in oc.body if not isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+        nb = [st for st in nc.body if not isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+        if len(ob) != len(nb):
+            continue
+        names: set[str] = set()
+        ok = True
+        for a, b in zip(ob, nb):
+            if ast.dump(a) == ast.dump(b):
+                continue
+            ta, tb = target(a), target(b)
+            if ta is None or ta != tb or ta not in safe or type(a) is not type(b):
+                ok = False
+                break
+            names.add(ta)
+        if ok and names:
+            out[q] = names
     return out
 
 
@@ -640,6 +712,13 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
         plan.hotswap_files.discard(os.path.join(SRC, rel))
         plan.patched.pop(os.path.join(SRC, rel), None)  # nothing to run differently
         return
+    if _docstrings_only(old_text, new_text):
+        # tests.json holds no doctests (tests/test_docs.py builds them in load_tests), and nothing
+        # else reads __doc__ beyond "is it None"; so a docstring edit cannot change any listed test
+        plan.notes.append(f"{rel}: docstrings only")
+        plan.hotswap_files.discard(os.path.join(SRC, rel))
+        plan.patched.pop(os.path.join(SRC, rel), None)
+        return
     if maps.cmp_ok and _only_equivalent_swaps(fp, old_text, new_text, rel, maps.cmp_ok):
         plan.notes.append(f"{rel}: is/== swaps at sites where both forms always agreed")
         plan.hotswap_files.discard(os.path.join(SRC, rel))
@@ -671,6 +750,7 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
     removed = "\n".join(l[1:] for h in fp.hunks for l in h.lines if l[:1] == "-")
     global_attr = bool(_GLOBAL_ATTR.search(added) or _GLOBAL_ATTR.search(removed))
     forced_import = _import_time_lines(fp, old_text, new_text, regions, touched, neighbors)
+    attr_changes = _class_attr_changes(regions.tree, new_tree, maps.cattr_reads) if maps.cattr_reads else {}
     # changed code that runs while some module is imported (module/class level, or a function a
     # class body calls, e.g. a parser method behind a pre-parsed constant): re-import those
     # modules under the patch. Insertion points count when inside a body or at module level;
@@ -691,7 +771,9 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
         probe |= maps.import_modules_using(gone)
         plan.notes.append(f"{rel}: unbound {sorted(gone)[:3]}")
     if probe:
-        plan.probe |= probe
+        # data consumed by the SQL tokenizer/parser (expression arg_types, tokenizer slots,
+        # keyword tables) changes what the modules that parse SQL at import time do
+        plan.probe |= probe | maps.sql_at_import
         plan.hotswap = False
     for ln in sorted(touched | neighbors):
         fn = None if ln in forced_import else regions.innermost(ln)
@@ -726,6 +808,17 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
         where = regions.class_at(ln)
         if where is None or where[1] or global_attr:
             module_level = True
+            continue
+        names = attr_changes.get(where[0])
+        if names:
+            # only values of data attributes that nothing reads at import time changed: the tests
+            # affected are those that execute a statement reading one of them
+            for nm in names:
+                for f, spans in maps.cattr_reads[nm].items():
+                    for a, b in spans:
+                        span_hit |= maps.lines_in_range(f, a, b)
+                        plan.spans.append((f, a, b))
+            plan.notes.append(f"{rel}: class attr {where[0]}.{','.join(sorted(names))}")
             continue
         qual = f"{modname}.{where[0]}"
         if qual in maps.tracked:
