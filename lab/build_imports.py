@@ -181,10 +181,16 @@ for f, fl in a["lines"].items():
         if any(s0 <= int(ln) <= e0 for s0, e0 in spans):
             sql_at_import |= {a["modules"][i] for i in ms if a["modules"][i] != own_mod(f)}
 print(f"modules running the parser at import: {sorted(sql_at_import)}")
+# files whose code or data those imports go through: every file they execute at import, plus the
+# expression classes (arg_types etc. are read by the generic Expression code)
+mid_sql = {i for i, m in enumerate(a["modules"]) if m in sql_at_import}
+sql_files = {f for f, fl in a["lines"].items() if any(set(ms) & mid_sql for ms in fl.values())}
+sql_files |= {f for f in trees if f.startswith("sqlglot/expressions/")}
+print(f"files feeding them: {len(sql_files)}")
 
 out = {"modules": a["modules"], "lines": a["lines"], "collect": c,
        "names": {k: sorted(v) for k, v in names.items()}, "cattr_reads": cattr_reads,
-       "sql_at_import": sorted(sql_at_import)}
+       "sql_at_import": sorted(sql_at_import), "sql_files": sorted(sql_files)}
 with gzip.open(OUT, "wt") as fh:
     json.dump(out, fh, separators=(",", ":"))
 print(f"names {len(names)}; size {os.path.getsize(OUT)}")

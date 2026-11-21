@@ -88,6 +88,7 @@ class Maps:
         self.imp_names: dict = {}
         self.cattr_reads: dict = {}
         self.sql_at_import: set[str] = set()
+        self.sql_files: set[str] = set()
         try:
             with gzip.open(os.path.join(os.path.dirname(path), "imports.json.gz"), "rt") as fh:
                 di = json.load(fh)
@@ -96,6 +97,7 @@ class Maps:
             self.imp_names = di.get("names", {})
             self.cattr_reads = di.get("cattr_reads", {})
             self.sql_at_import = set(di.get("sql_at_import", []))
+            self.sql_files = set(di.get("sql_files", []))
         except (OSError, ValueError, KeyError):
             pass
         self.lambdas_traced = bool(d.get("lambdas_traced"))
@@ -358,7 +360,10 @@ def _coding_cookie(text: str):
 def python_semantically_equal(old: str, new: str) -> bool:
     if _coding_cookie(old) != _coding_cookie(new):
         return False
-    a, b = _tokens(old), _tokens(new)
+    try:
+        a, b = _tokens(old), _tokens(new)
+    except (ValueError, UnicodeError, RecursionError):  # e.g. undecodable bytes in the patch
+        return False
     return a is not None and b is not None and a == b
 
 
@@ -371,7 +376,7 @@ class Regions:
         self.classes: list[tuple[int, int, int, str, list]] = []
         try:
             tree = ast.parse(text)
-        except SyntaxError:
+        except (SyntaxError, ValueError):
             self.ok = False
             self.tree = None
             return
@@ -728,7 +733,7 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
     new_ok = True
     try:
         new_tree = ast.parse(new_text)
-    except SyntaxError:
+    except (SyntaxError, ValueError):
         new_ok = False
     touched, neighbors = changed_old_lines(fp)
     if not regions.ok or not new_ok:
@@ -773,7 +778,7 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
     if probe:
         # data consumed by the SQL tokenizer/parser (expression arg_types, tokenizer slots,
         # keyword tables) changes what the modules that parse SQL at import time do
-        plan.probe |= probe | maps.sql_at_import
+        plan.probe |= probe | (maps.sql_at_import if rel in maps.sql_files else set())
         plan.hotswap = False
     for ln in sorted(touched | neighbors):
         fn = None if ln in forced_import else regions.innermost(ln)
@@ -810,17 +815,22 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
             module_level = True
             continue
         names = attr_changes.get(where[0])
+        qual = f"{modname}.{where[0]}"
         if names:
-            # only values of data attributes that nothing reads at import time changed: the tests
-            # affected are those that execute a statement reading one of them
+            # only values of data attributes that nothing reads at import time changed: a test can
+            # only notice if it executes a statement reading one of them AND uses the class (the
+            # usual class rule); both are over-approximations, so their intersection is too
+            base = maps.instance_tests(qual) if qual in maps.tracked else maps.module_tests(rel)
+            readers: set[int] = set()
             for nm in names:
                 for f, spans in maps.cattr_reads[nm].items():
                     for a, b in spans:
-                        span_hit |= maps.lines_in_range(f, a, b)
+                        readers |= maps.lines_in_range(f, a, b)
                         plan.spans.append((f, a, b))
-            plan.notes.append(f"{rel}: class attr {where[0]}.{','.join(sorted(names))}")
+            span_hit |= readers & base
+            plan.notes.append(f"{rel}: class attr {where[0]}.{','.join(sorted(names))} "
+                              f"{len(readers & base)}/{len(base)}")
             continue
-        qual = f"{modname}.{where[0]}"
         if qual in maps.tracked:
             class_quals.add(qual)
         else:
@@ -858,7 +868,7 @@ def _only_equivalent_swaps(fp: FilePatch, old_text: str, new_text: str, rel: str
         return False  # only 1:1 line replacements qualify
     try:
         tree = ast.parse(old_text)
-    except SyntaxError:
+    except (SyntaxError, ValueError):
         return False
     compares = [n for n in ast.walk(tree) if isinstance(n, ast.Compare) and len(n.ops) == 1]
     old_l, new_l = old_text.split("\n"), new_text.split("\n")
@@ -895,7 +905,7 @@ def _module_constant_tests(fp: FilePatch, old_text: str, new_text: str, rel: str
         return None
     try:
         t_old, t_new = ast.parse(old_text), ast.parse(new_text)
-    except SyntaxError:
+    except (SyntaxError, ValueError):
         return None
     old_l, new_l = old_text.split("\n"), new_text.split("\n")
 
@@ -1085,7 +1095,14 @@ def main() -> None:
     for c in commits:
         with open(os.path.join(commit_dir, c + ".patch"), encoding="utf-8", errors="surrogateescape", newline="") as fh:
             text = fh.read()
-        plans.append(plan_commit(c, text, maps, tests))
+        try:
+            plans.append(plan_commit(c, text, maps, tests))
+        except Exception as e:  # never let one odd patch sink the run: list every test for it
+            p = Plan(c)
+            p.fallback = True
+            p.candidates = set(range(len(tests)))
+            p.notes.append(f"planning error {e!r}: listing all")
+            plans.append(p)
     log(f"planned {len(plans)} commits in {time.time()-t0:.2f}s")
 
     global MAX_NODES_N
@@ -1098,7 +1115,9 @@ def main() -> None:
         if p.fallback:
             p.listed = set(p.candidates)
             cheap = []
-        else:
+            results[p.commit] = set(p.listed)
+            continue
+        try:
             plan_partials(p, maps, cpu_cost)
             # test_max_nodes can be verified at a smaller scale (runner._max_nodes_scaled) unless
             # the patch edits the test itself
@@ -1112,6 +1131,9 @@ def main() -> None:
             p.listed = listed
             cheap = sorted(verify)
             p.case_filter = _case_filter(p, set(cheap), maps)
+        except Exception as e:
+            p.listed, cheap, p.probe = set(p.candidates), [], set()
+            p.notes.append(f"setup error {e!r}: listing all candidates")
         if cheap or (p.probe and not p.fallback):
             jobs.append((p, cheap))
         else:
@@ -1121,12 +1143,18 @@ def main() -> None:
     PROBE_SWEEP = sorted(set(maps.imp_mods) | {m for ms in maps.collect.values() for m in ms})
     MAPS_OBJ = maps
     if jobs:
-        _preload(sorted({ids[n].split("::")[0][:-3].replace("/", ".") for _, cheap in jobs for n in cheap}))
-        _run_jobs(jobs, ids, dur_ms, results)
+        try:
+            _preload(sorted({ids[n].split("::")[0][:-3].replace("/", ".") for _, cheap in jobs for n in cheap}))
+            _run_jobs(jobs, ids, dur_ms, results)
+        except Exception as e:
+            log(f"run error {e!r}: listing every unverified candidate")
+            for p, cheap in jobs:
+                if p.commit not in results:
+                    results[p.commit] = set(getattr(p, "listed", set())) | set(cheap)
 
     for p in plans:
-        sel = sorted(results.get(p.commit, set(p.listed)))
-        print(json.dumps({"commit": p.commit, "workers": split_workers(sel, dur_ms)}), flush=True)
+        sel = sorted(results.get(p.commit, set(getattr(p, "listed", p.candidates))))
+        _emit(p.commit, split_workers(sel, dur_ms))
         log(f"{p.commit}: cand={len(p.candidates)} out={len(sel)} {'; '.join(p.notes)}")
     import resource
     me, ch = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -1393,5 +1421,38 @@ def _run_jobs(jobs, ids, dur_ms, results):
                 plan.notes.append("child timeout: listing all")
 
 
+_PRINTED: set[str] = set()
+
+
+def _emit(commit: str, workers) -> None:
+    print(json.dumps({"commit": commit, "workers": workers}), flush=True)
+    _PRINTED.add(commit)
+
+
+def _emergency_output() -> None:
+    """Last resort after an unexpected failure: every commit not yet printed gets every test, so
+    the run stays valid (a missing line rejects the whole run)."""
+    try:
+        tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
+        nums = [t["number"] for t in tests]
+        dur = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+        bins = [[] for _ in range(8)]
+        loads = [0] * 8
+        for n in sorted(nums, key=lambda n: -dur[n]):
+            i = loads.index(min(loads))
+            bins[i].append(n)
+            loads[i] += dur[n]
+        workers = [b for b in bins if b]
+    except Exception:
+        workers = []
+    for f in sorted(os.listdir(os.path.join(DATA, "commits"))):
+        if f.endswith(".patch") and f[:-6] not in _PRINTED:
+            _emit(f[:-6], workers)
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as e:  # noqa: BLE001
+        log(f"FATAL {e!r}")
+        _emergency_output()
