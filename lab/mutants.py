@@ -214,8 +214,140 @@ def mut_delete_or_syntax():
     return "rename_def", diff(rel, text, rel, new)
 
 
+def mut_move():
+    """git-style pure rename of a module (no hunks): its importers now fail."""
+    rel = rng.choice([p for p in PY if not p.endswith("__init__.py")])
+    d, f = os.path.split(rel)
+    to = f"{d}/{f[:-3]}_moved.py"
+    return "move", (f"diff --git a/{rel} b/{to}\nsimilarity index 100%\nrename from {rel}\nrename to {to}\n")
+
+
+def mut_delete_module():
+    rel = rng.choice([p for p in PY if not p.endswith("__init__.py")] + [t for t in TESTPY if "/test_" in t])
+    return "delete", diff(rel, read(rel), rel, None)
+
+
+def _bodies(text):
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    return [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.body]
+
+
+def mut_insert():
+    """Insert a statement inside a function body (early return, or a guard that raises)."""
+    for _ in range(30):
+        rel = pick_py()
+        text = read(rel)
+        fns = _bodies(text)
+        if not fns:
+            continue
+        fn = rng.choice(fns)
+        st = rng.choice(fn.body)
+        if isinstance(st, ast.Expr) and isinstance(getattr(st, "value", None), ast.Constant):
+            continue  # docstring
+        lines = text.split("\n")
+        i = st.lineno - 1
+        indent = re.match(r"\s*", lines[i]).group(0)
+        stmt = rng.choice(["return None", "raise ValueError('unexpected')", "pass",
+                           "args = ()" if "args" in lines[i] else "_unused = 0"])
+        lines.insert(i, indent + stmt)
+        new = "\n".join(lines)
+        try:
+            ast.parse(new)
+        except SyntaxError:
+            continue
+        return "insert", diff(rel, text, rel, new)
+    return None
+
+
+def mut_import():
+    """Remove (or duplicate-shadow) a module-level import."""
+    for _ in range(30):
+        rel = pick_py()
+        text = read(rel)
+        lines = text.split("\n")
+        idx = [i for i, l in enumerate(lines) if re.match(r"(from \S+ import [^(]+|import \S+)\s*$", l)
+               and "__future__" not in l and "typing" not in l]
+        if not idx:
+            continue
+        i = rng.choice(idx)
+        del lines[i]
+        new = "\n".join(lines)
+        try:
+            ast.parse(new)
+        except SyntaxError:
+            continue
+        return "import", diff(rel, text, rel, new)
+    return None
+
+
+def mut_helper():
+    rel = rng.choice([t for t in TESTPY if t.endswith(("helpers.py", "conftest.py", "__init__.py")) and read(t).strip()]
+                     or ["tests/helpers.py"])
+    text = read(rel)
+    lines = text.split("\n")
+    idx = [i for i, l in enumerate(lines) if l.strip() and not l.strip().startswith("#")]
+    for _ in range(30):
+        i = rng.choice(idx)
+        l = lines[i]
+        for a, b in SWAPS:
+            if a in l:
+                lines[i] = l.replace(a, b, 1)
+                new = "\n".join(lines)
+                try:
+                    ast.parse(new)
+                except SyntaxError:
+                    lines[i] = l
+                    continue
+                return "helper", diff(rel, text, rel, new)
+    return None
+
+
+def mut_docs():
+    cands = [f for f in ("README.md", "CHANGELOG.md", "CONTRIBUTING.md", "Makefile", "setup.cfg", ".gitignore")
+             if os.path.exists(os.path.join(SRC, f))]
+    if not cands:
+        return None
+    rel = rng.choice(cands)
+    text = read(rel)
+    return "docs", diff(rel, text, rel, text + "\n" + rng.choice(["# note", "notes"]) + "\n")
+
+
+def mut_class_attr():
+    """Change one entry of a class-level dict/set/list/tuple (TYPE_MAPPING, KEYWORDS, ...)."""
+    for _ in range(40):
+        rel = pick_py()
+        text = read(rel)
+        lines = text.split("\n")
+        idx = [i for i, l in enumerate(lines) if re.match(r"\s{8,}(exp\.\w+|\"[^\"]+\"|'[^']+'|TokenType\.\w+)\s*[:,]", l)]
+        if not idx:
+            continue
+        i = rng.choice(idx)
+        l = lines[i]
+        if l.rstrip().endswith(",") and rng.random() < 0.5:
+            del lines[i]
+        else:
+            m = re.search(r'"([A-Z_]+)"', l)
+            if not m:
+                continue
+            lines[i] = l[: m.start(1)] + m.group(1) + "X" + l[m.end(1):]
+        new = "\n".join(lines)
+        try:
+            ast.parse(new)
+        except SyntaxError:
+            continue
+        return "class_attr", diff(rel, text, rel, new)
+    return None
+
+
 KINDS = [(mut_code, 50), (mut_fixture, 20), (mut_comment, 8), (mut_testfile, 8), (mut_new_file, 3),
          (mut_delete_or_syntax, 4)]
+if len(sys.argv) > 5 and sys.argv[5] == "new":
+    KINDS = [(mut_code, 15), (mut_fixture, 5), (mut_testfile, 5), (mut_delete_or_syntax, 6), (mut_move, 6),
+             (mut_delete_module, 6), (mut_insert, 20), (mut_import, 12), (mut_helper, 6), (mut_docs, 3),
+             (mut_class_attr, 16)]
 os.makedirs(OUT, exist_ok=True)
 meta = {}
 n = 0

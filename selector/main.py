@@ -85,11 +85,13 @@ class Maps:
         self.imp_mods: list[str] = []
         self.imp_lines: dict = {}
         self.collect: dict[str, set[str]] = {}
+        self.imp_names: dict = {}
         try:
             with gzip.open(os.path.join(os.path.dirname(path), "imports.json.gz"), "rt") as fh:
                 di = json.load(fh)
             self.imp_mods, self.imp_lines = di["modules"], di["lines"]
             self.collect = {f: set(v) for f, v in di["collect"].items()}
+            self.imp_names = di.get("names", {})
         except (OSError, ValueError, KeyError):
             pass
         self.lambdas_traced = bool(d.get("lambdas_traced"))
@@ -132,6 +134,14 @@ class Maps:
         out = set()
         for ln in lines:
             for i in fl.get(str(ln), ()):
+                out.add(self.imp_mods[i])
+        return out
+
+    def import_modules_using(self, names) -> set[str]:
+        """Modules whose import executes a statement that mentions one of these names."""
+        out = set()
+        for n in names:
+            for i in self.imp_names.get(n, ()):
                 out.add(self.imp_mods[i])
         return out
 
@@ -207,6 +217,42 @@ class Maps:
         return out
 
 
+def _bindings(tree) -> set[str]:
+    """Names bound at module level or in class bodies (imports, defs, classes, assignments)."""
+    out: set[str] = set()
+
+    def targets(t):
+        if isinstance(t, ast.Name):
+            out.add(t.id)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                targets(e)
+
+    def walk(body):
+        for node in body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for a in node.names:
+                    out.add(a.asname or a.name.split(".")[0])
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out.add(node.name)
+            elif isinstance(node, ast.ClassDef):
+                out.add(node.name)
+                walk(node.body)
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    targets(t)
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                targets(node.target)
+            elif isinstance(node, (ast.If, ast.Try, ast.With, ast.For, ast.While)):
+                for attr in ("body", "orelse", "finalbody"):
+                    walk(getattr(node, attr, []) or [])
+                for hnd in getattr(node, "handlers", []) or []:
+                    walk(hnd.body)
+
+    walk(tree.body)
+    return out
+
+
 def _modname(rel: str) -> str:
     m = rel[:-3].replace("/", ".")
     return m[: -len(".__init__")] if m.endswith(".__init__") else m
@@ -255,8 +301,10 @@ class Regions:
             tree = ast.parse(text)
         except SyntaxError:
             self.ok = False
+            self.tree = None
             return
         self.ok = True
+        self.tree = tree
         # statement spans: simple statements = whole span; compound statements = header only
         self.stmts: list[tuple[int, int]] = []
         # code-region details keyed by (body_start, body_end, first): (kind, node)
@@ -600,7 +648,7 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
     regions = Regions(old_text)
     new_ok = True
     try:
-        ast.parse(new_text)
+        new_tree = ast.parse(new_text)
     except SyntaxError:
         new_ok = False
     touched, neighbors = changed_old_lines(fp)
@@ -636,6 +684,12 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
         if sp is not None:
             probe_lines.update(range(sp[0], sp[1] + 1))
     probe = maps.import_modules_at(rel, probe_lines)
+    # a module/class-level name that no longer exists (removed import, renamed def, deleted
+    # constant or class attribute) breaks every module whose import-time code mentions it
+    gone = _bindings(regions.tree) - _bindings(new_tree) if regions.ok else set()
+    if gone:
+        probe |= maps.import_modules_using(gone)
+        plan.notes.append(f"{rel}: unbound {sorted(gone)[:3]}")
     if probe:
         plan.probe |= probe
         plan.hotswap = False
