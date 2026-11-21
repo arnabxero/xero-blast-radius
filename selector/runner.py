@@ -22,6 +22,66 @@ import sys
 import unittest
 
 
+class _InlineExecutor:
+    """Stand-in for ProcessPoolExecutor: runs tasks in this process.
+
+    sqlglot's optimizer/executor tests create spawn-based process pools (one process per CPU).
+    In the scorer's sandbox that costs ~1 CPU-second per spawned process and can exceed the
+    256-process limit; the computations are pure, so running them inline gives the same results.
+    """
+
+    # Everything crossing the process boundary is pickled and unpickled exactly like a real
+    # pool would (ForkingPickler), because sqlglot pickles expressions via sqlglot/serde.py and
+    # a change there breaks pool-using tests only through that round trip.
+
+    @staticmethod
+    def _roundtrip(obj):
+        import pickle
+        from multiprocessing.reduction import ForkingPickler
+
+        return pickle.loads(ForkingPickler.dumps(obj))
+
+    def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kwargs):
+        if initializer is not None:
+            initializer, initargs = self._roundtrip((initializer, initargs))
+            initializer(*initargs)
+
+    def submit(self, fn, /, *args, **kwargs):
+        from concurrent.futures import Future
+
+        f = Future()
+        try:
+            fn, args, kwargs = self._roundtrip((fn, args, kwargs))
+            f.set_result(self._roundtrip(fn(*args, **kwargs)))
+        except BaseException as e:  # noqa: BLE001
+            f.set_exception(e)
+        return f
+
+    def map(self, fn, *iterables, timeout=None, chunksize=1, **kwargs):
+        return [self.submit(fn, *a).result() for a in zip(*iterables)]
+
+    def shutdown(self, wait=True, *, cancel_futures=False):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def install_inline_executor():
+    import concurrent.futures as cf
+
+    cf.ProcessPoolExecutor = _InlineExecutor
+    try:
+        import concurrent.futures.process as cfp
+
+        cfp.ProcessPoolExecutor = _InlineExecutor
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class _Timeout(Exception):
     """Raised by SIGALRM inside a test; re-armed every 0.25 s in case code swallows it."""
 
@@ -169,6 +229,7 @@ def run_tests(src_root: str, test_ids: list[str], patched: dict[str, str | None]
     other_patched = {p: t for p, t in patched.items() if not p.endswith(".py")}
     deleted_py = {p for p, t in py_patched.items() if t is None}
 
+    install_inline_executor()
     _install_file_overlay(other_patched)
     if py_patched:
         _purge_modules()

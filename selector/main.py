@@ -53,6 +53,11 @@ class Maps:
         self.mod_run = d["mod_run"]
         self.mod_import = d["mod_import"]
         self.opened = d["opened"]
+        self.class_tests = d.get("class_tests", {})
+        self.tracked = set(d.get("tracked", []))
+
+    def instance_tests(self, qual: str) -> set[int]:
+        return set(self._s(self.class_tests.get(qual)))
 
     def _s(self, idx):
         return self.sets[idx] if idx is not None else ()
@@ -128,12 +133,16 @@ class Regions:
 
     def __init__(self, text: str):
         self.funcs: list[tuple[int, int, int]] = []  # (body_start, body_end, def_line)
+        # class bodies: (header_start, body_start, body_end, qualname, body statements)
+        self.classes: list[tuple[int, int, int, str, list]] = []
         try:
             tree = ast.parse(text)
         except SyntaxError:
             self.ok = False
             return
         self.ok = True
+        # statement spans: simple statements = whole span; compound statements = header only
+        self.stmts: list[tuple[int, int]] = []
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 if node.body:
@@ -142,6 +151,40 @@ class Regions:
                     self.funcs.append((start, node.end_lineno or start, node.lineno))
             elif isinstance(node, ast.Lambda):
                 self.funcs.append((node.body.lineno, node.body.end_lineno or node.body.lineno, node.lineno))
+            if isinstance(node, ast.stmt):
+                body = getattr(node, "body", None)
+                if isinstance(body, list) and body and isinstance(body[0], ast.stmt):
+                    hdr_end = max(node.lineno, body[0].lineno - 1)
+                    if body[0].lineno == node.lineno:  # one-line compound: `if x: y`
+                        hdr_end = node.end_lineno or node.lineno
+                    self.stmts.append((node.lineno, hdr_end))
+                else:
+                    self.stmts.append((node.lineno, node.end_lineno or node.lineno))
+        self._walk_classes(tree.body, [], in_func=False)
+
+    def stmt_span(self, line: int):
+        """Smallest statement span containing `line` (None if the line is not inside one)."""
+        best = None
+        for s, e in self.stmts:
+            if s <= line <= e and (best is None or (e - s) < (best[1] - best[0])):
+                best = (s, e)
+        return best
+
+    def _walk_classes(self, body, chain, in_func):
+        for node in body:
+            if isinstance(node, ast.ClassDef):
+                header = min([node.lineno] + [d.lineno for d in node.decorator_list])
+                q = chain + [node.name]
+                if not in_func and node.body:
+                    self.classes.append((header, node.body[0].lineno, node.end_lineno or node.lineno, ".".join(q), node.body))
+                self._walk_classes(node.body, q, in_func)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self._walk_classes(node.body, chain + [node.name, "<locals>"], True)
+            else:
+                for field in ("body", "orelse", "finalbody", "handlers"):
+                    sub = getattr(node, field, None)
+                    if isinstance(sub, list):
+                        self._walk_classes([s for s in sub if isinstance(s, ast.AST)], chain, in_func)
 
     def innermost(self, line: int):
         best = None
@@ -149,6 +192,24 @@ class Regions:
             if s <= line <= e and (best is None or (e - s) < (best[1] - best[0])):
                 best = (s, e, d)
         return best
+
+    def class_at(self, line: int):
+        """(qualname, is_header, statement) of the innermost class whose header/body holds `line`."""
+        best = None
+        for h, s, e, q, body in self.classes:
+            if h <= line <= e and (best is None or (e - h) < (best[2] - best[0])):
+                best = (h, s, e, q, body)
+        if best is None:
+            return None
+        h, s, e, q, body = best
+        if line < s:
+            return q, True, None
+        stmt = None
+        for st in body:
+            if st.lineno <= line <= (st.end_lineno or st.lineno):
+                stmt = st
+                break
+        return q, False, stmt
 
 
 # ----------------------------------------------------------------------------- planning
@@ -210,7 +271,7 @@ def plan_commit(commit: str, text: str, maps: Maps, tests: list[dict]) -> Plan:
         else:
             plan.patched[os.path.join(SRC, fp.path)] = new_text
 
-        for rel in rels:
+        for rel in dict.fromkeys(rels):
             _candidates_for_file(plan, maps, rel, fp, old_text, new_text)
     return plan
 
@@ -264,24 +325,51 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
         plan.notes.append(f"{rel}: syntax error -> module users {len(hit)}")
         return
     hit: set[int] = set()
-    import_time = False
+    module_level = False
+    class_quals: set[str] = set()
+    modname = rel[:-3].replace("/", ".")
+    if modname.endswith(".__init__"):
+        modname = modname[: -len(".__init__")]
+    added = "\n".join(l[1:] for h in fp.hunks for l in h.lines if l[:1] == "+")
+    removed = "\n".join(l[1:] for h in fp.hunks for l in h.lines if l[:1] == "-")
+    global_attr = bool(_GLOBAL_ATTR.search(added) or _GLOBAL_ATTR.search(removed))
     for ln in sorted(touched | neighbors):
         fn = regions.innermost(ln)
-        if fn is None:
-            if ln in touched or _neighbor_is_code(old_text, ln):
-                import_time = True
+        if fn is not None:
+            fs, fe, _ = fn
+            # A deterministic test can only behave differently if it executes the changed
+            # statement (or reaches the insertion point). Use the statement's full span so
+            # continuation lines without their own line events are still covered; fall back
+            # to the whole function when the line is not inside a statement within it.
+            span = regions.stmt_span(ln)
+            if span is None or span[0] < fs or span[1] > fe:
+                span = (fs, fe)
+            hit |= maps.lines_in_range(rel, span[0], span[1])
             continue
-        s, e, _ = fn
-        hit |= maps.lines_in_range(rel, s, e)
-    if import_time:
+        # import-time line: class body (data/structure of one class) or module level
+        where = regions.class_at(ln)
+        if where is None or where[1] or global_attr:
+            module_level = True
+            continue
+        qual = f"{modname}.{where[0]}"
+        if qual in maps.tracked:
+            class_quals.add(qual)
+        else:
+            module_level = True
+    for q in class_quals:
+        hit |= maps.instance_tests(q)
+    if module_level:
         hit |= maps.module_tests(rel)
     plan.candidates |= hit
-    plan.notes.append(f"{rel}: {'import-time' if import_time else 'runtime'} {len(hit)} cand")
+    kind = "module-level" if module_level else ("class " + ",".join(sorted(class_quals)) if class_quals else "runtime")
+    plan.notes.append(f"{rel}: {kind} {len(hit)} cand")
 
 
-def _neighbor_is_code(text: str, ln: int) -> bool:
-    # an insertion next to a module/class-level line: treat as import-time (new statement at that level)
-    return True
+# Class attributes that feed global registries (e.g. SQL function name -> class); a change to
+# one of them can affect tests that never instantiate the class, so they get module-wide treatment.
+import re as _re  # noqa: E402
+
+_GLOBAL_ATTR = _re.compile(r"^\s*(_sql_names|key)\s*[:=]", _re.M)
 
 
 # ----------------------------------------------------------------------------- execution
@@ -322,15 +410,17 @@ def main() -> None:
         plans.append(plan_commit(c, text, maps, tests))
     log(f"planned {len(plans)} commits in {time.time()-t0:.2f}s")
 
+    cpu_cost = _load_cpu_costs(ids, dur_ms)
     results: dict[str, set[int]] = {}
     jobs = []
     for p in plans:
-        heavy = {n for n in p.candidates if dur_ms[n] > HEAVY_S * 1000}
-        cheap = sorted(p.candidates - heavy)
-        p.listed = set(heavy)
         if p.fallback:
-            p.listed |= set(cheap)
+            p.listed = set(p.candidates)
             cheap = []
+        else:
+            verify, listed = choose_verify(p.candidates, dur_ms, cpu_cost)
+            p.listed = listed
+            cheap = sorted(verify)
         if cheap:
             jobs.append((p, cheap))
         else:
@@ -350,12 +440,78 @@ def main() -> None:
     log(f"total {time.time()-t0:.2f}s wall, cpu {cpu:.2f}s (self+children)")
 
 
+P_FAIL = 0.25  # rough chance that a candidate actually fails (only steers run-vs-list choices)
+
+
+def _load_cpu_costs(ids, dur_ms) -> list[float]:
+    """CPU seconds it costs to run each test in our runner.
+
+    Measured for slow tests (maps/cpu_cost.json). Otherwise estimated: optimizer tests fan out
+    to a process pool in the labelled run, so their recorded (wall) time understates the
+    serial CPU cost by ~4x; other tests cost about their recorded time.
+    """
+    measured = {}
+    try:
+        with open(os.path.join(os.path.dirname(MAPS), "cpu_cost.json")) as fh:
+            measured = json.load(fh)
+    except FileNotFoundError:
+        pass
+    out = []
+    for tid, d in zip(ids, dur_ms):
+        if tid in measured:
+            out.append(measured[tid])
+        elif tid.startswith("tests/test_optimizer.py::") or tid.startswith("tests/test_executor.py::"):
+            out.append(4.0 * d / 1000 + 0.01)
+        else:
+            out.append(1.2 * d / 1000 + 0.002)
+    return out
+
+
+def choose_verify(cands: set[int], dur_ms: list[int], cpu: list[float]):
+    """Split candidates into (run them to find out, list them without running)."""
+    if not cands:
+        return set(), set()
+    MAX_RUN_S = 8.0
+    must_list = {n for n in cands if cpu[n] > MAX_RUN_S or cpu[n] > dur_ms[n] / 1000 + 2.0}
+    rest = cands - must_list
+    if must_list:
+        # the 2 s worker fee is paid anyway: list whatever is cheaper to list than to run,
+        # as long as it does not lengthen the busiest worker
+        base = split_workers(sorted(must_list), dur_ms)
+        base_cost = _pack_cost(base, dur_ms)
+        listed = set(must_list)
+        for n in sorted(rest, key=lambda n: -dur_ms[n]):
+            if cpu[n] <= dur_ms[n] / 1000:
+                continue
+            trial = split_workers(sorted(listed | {n}), dur_ms)
+            if (_pack_cost(trial, dur_ms) - base_cost) / 1000 <= cpu[n] * (1 - P_FAIL):
+                listed.add(n)
+                base_cost = _pack_cost(trial, dur_ms)
+        return rest - listed, listed
+    # nothing must be listed: either run everything, or list everything without running
+    run_cost = sum(cpu[n] for n in rest)
+    list_cost = _pack_cost(split_workers(sorted(rest), dur_ms), dur_ms) / 1000
+    if list_cost <= run_cost + P_FAIL * 2.0 and len(rest) <= 3:
+        return set(), set(rest)
+    return set(rest), set()
+
+
+def _pack_cost(bins, dur_ms) -> int:
+    if not bins:
+        return 0
+    return max(sum(dur_ms[n] for n in b) for b in bins) + WORKER_COST_MS * len(bins)
+
+
 def _preload():
     os.environ.setdefault("SKIP_INTEGRATION", "0")
     if SRC not in sys.path:
         sys.path.insert(0, SRC)
     os.chdir(SRC)
     import unittest  # noqa: F401
+
+    from runner import install_inline_executor
+
+    install_inline_executor()
     try:
         import sqlglot  # noqa: F401
         import sqlglot.optimizer  # noqa: F401

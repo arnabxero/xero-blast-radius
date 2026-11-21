@@ -5,7 +5,7 @@ TESTS="$1"; OUTDIR="$2"; PAR="${3:-16}"
 mkdir -p /tmp/x "$OUTDIR"
 cp -r /src/. /tmp/x/
 cd /tmp/x || exit 1
-export PYTHONPATH="/tmp/x:/lab" TRACE_ROOT=/tmp/x SKIP_INTEGRATION=0
+export PYTHONPATH="/tmp/x:/repo/lab" TRACE_ROOT=/tmp/x SKIP_INTEGRATION=0 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
 python - "$TESTS" > /tmp/ids.txt <<'EOF'
 import json, sys
 for t in json.load(open(sys.argv[1]))["tests"]:

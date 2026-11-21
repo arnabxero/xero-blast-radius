@@ -16,6 +16,7 @@ COPY maps /app/maps
 RUN python -m compileall -q /app/selector && chmod -R a+rX /app
 
 ENV SQLGLOT_SRC=/opt/sqlglot \
+    OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
     SKIP_INTEGRATION=0 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1

@@ -39,6 +39,8 @@ def main(trace_dir: str, tests_json: str, out_path: str) -> None:
     mod_run: dict[str, set[int]] = {}
     mod_import: dict[str, set[int]] = {}
     opened: dict[str, set[int]] = {}
+    class_tests: dict[str, set[int]] = {}
+    tracked: set[str] = set()
     ok = []
     missing = []
     for t in tests:
@@ -48,7 +50,12 @@ def main(trace_dir: str, tests_json: str, out_path: str) -> None:
             missing.append(num)
             ok.append(False)
             continue
-        d = json.load(open(p))
+        try:
+            d = json.load(open(p))
+        except ValueError:
+            missing.append(num)
+            ok.append(False)
+            continue
         ok.append(all(v == "passed" for v in d["outcome"].values()) and bool(d["outcome"]))
         for f, lns in d["run"].items():
             mod_run.setdefault(f, set()).add(num)
@@ -57,6 +64,9 @@ def main(trace_dir: str, tests_json: str, out_path: str) -> None:
                 fl.setdefault(ln, set()).add(num)
         for f in d["import"]:
             mod_import.setdefault(f, set()).add(num)
+        for c in d.get("types", []):
+            class_tests.setdefault(c, set()).add(num)
+        tracked.update(d.get("tracked", []))
         for f in d["opened_run"] + d["opened_import"]:
             if f.endswith(".py") or f.endswith(".pyc") or "__pycache__" in f:
                 continue
@@ -69,6 +79,8 @@ def main(trace_dir: str, tests_json: str, out_path: str) -> None:
         "mod_import": {f: intern(s) for f, s in sorted(mod_import.items())},
         "opened": {f: intern(s) for f, s in sorted(opened.items())},
         "outcome_ok": ok,
+        "class_tests": {c: intern(s) for c, s in sorted(class_tests.items())},
+        "tracked": sorted(tracked),
     }
     out["line_sets"] = sets
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
