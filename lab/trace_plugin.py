@@ -75,6 +75,9 @@ def _audit(event, args):
 _started_in_import: set = set()  # (file, first line, qualname) of code that RAN during an import
 
 
+_lambdas_run: set = set()  # (file, first line) of lambdas CALLED during the test's run phase
+
+
 def _on_start(code, offset):
     # module bodies run during collection ("import" phase) or lazily (inside _importing)
     if _importing or _phase == "import":
@@ -82,6 +85,10 @@ def _on_start(code, offset):
         if f.startswith(ROOT):
             _started_in_import.add((f[len(ROOT):], code.co_firstlineno, code.co_qualname))
         return None
+    if _phase == "run" and code.co_name == "<lambda>":
+        f = code.co_filename
+        if f.startswith(ROOT):
+            _lambdas_run.add((f[len(ROOT):], code.co_firstlineno))
     return mon.DISABLE
 
 
@@ -243,6 +250,7 @@ def pytest_sessionfinish(session, exitstatus):
                 "opened_import": sorted(_opened["import"]),
                 "import_exec": pack(_lines["import_exec"]),
                 "started_in_import": sorted([list(x) for x in _started_in_import]),
+                "lambdas_run": sorted([list(x) for x in _lambdas_run]),
                 "case": _CASE,
                 "types": sorted({_qual(c) for t in _types_seen for c in t.__mro__ if c.__module__.startswith("sqlglot")}),
                 "tracked": _tracked_classes(),

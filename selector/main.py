@@ -58,6 +58,8 @@ class Maps:
         self.import_exec = {f: set(v) for f, v in d.get("import_exec", {}).items()}
         # functions/lambdas that were actually called while some module was being imported
         self.started_in_import = {(f, ln) for f, ln, _q in d.get("started_in_import", [])}
+        self.lambda_tests = d.get("lambda_tests", {})
+        self.lambdas_traced = bool(d.get("lambdas_traced"))
         cases = d.get("cases") or {}
         self.case_units = cases.get("units", [])
         self.case_lines = cases.get("lines", {})
@@ -72,6 +74,9 @@ class Maps:
                 ent["BASE"] = uid
             else:
                 ent["files"].setdefault(f, {})[k] = uid
+
+    def lambda_callers(self, f: str, first_line: int) -> set[int]:
+        return set(self._s(self.lambda_tests.get(f"{f}:{first_line}")))
 
     def case_units_in_range(self, f: str, lo: int, hi: int) -> set[int]:
         out: set[int] = set()
@@ -171,15 +176,21 @@ class Regions:
         self.ok = True
         # statement spans: simple statements = whole span; compound statements = header only
         self.stmts: list[tuple[int, int]] = []
+        # code-region details keyed by (body_start, body_end, first): (kind, node)
+        self.info: dict[tuple[int, int, int], tuple[str, ast.AST]] = {}
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 if node.body:
                     start = node.body[0].lineno
                     # third field = the code object's co_firstlineno (first decorator line, if any)
                     first = min([node.lineno] + [d.lineno for d in node.decorator_list])
-                    self.funcs.append((start, node.end_lineno or start, first))
+                    key = (start, node.end_lineno or start, first)
+                    self.funcs.append(key)
+                    self.info[key] = ("def", node)
             elif isinstance(node, ast.Lambda):
-                self.funcs.append((node.body.lineno, node.body.end_lineno or node.body.lineno, node.lineno))
+                key = (node.body.lineno, node.body.end_lineno or node.body.lineno, node.lineno)
+                self.funcs.append(key)
+                self.info[key] = ("lambda", node)
             if isinstance(node, ast.stmt):
                 body = getattr(node, "body", None)
                 if isinstance(body, list) and body and isinstance(body[0], ast.stmt):
@@ -190,6 +201,28 @@ class Regions:
                 else:
                     self.stmts.append((node.lineno, node.end_lineno or node.lineno))
         self._walk_classes(tree.body, [], in_func=False)
+
+    def outside_segments(self, fn, line: int, text_line: str):
+        """Text of `line` that lies outside the body of code region `fn` (import-time context).
+
+        Returns None when the whole line is inside the body. For lambdas the body is everything
+        between `lambda` and the end of the expression; for defs, the statements after the colon.
+        """
+        kind, node = self.info.get(fn, (None, None))
+        if node is None:
+            return None
+        if kind == "lambda":
+            s_line, s_col = node.lineno, node.col_offset
+            e_line, e_col = node.end_lineno, node.end_col_offset
+        else:
+            s_line, s_col = node.body[0].lineno, node.body[0].col_offset
+            e_line, e_col = node.end_lineno, node.end_col_offset
+        b = text_line.encode("utf-8")
+        before = b[:s_col].decode("utf-8", "replace") if line == s_line else ""
+        after = b[e_col:].decode("utf-8", "replace") if line == e_line else ""
+        if not before and not after:
+            return None
+        return before, after
 
     def stmt_span(self, line: int):
         """Smallest statement span containing `line` (None if the line is not inside one)."""
@@ -459,10 +492,20 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
     added = "\n".join(l[1:] for h in fp.hunks for l in h.lines if l[:1] == "+")
     removed = "\n".join(l[1:] for h in fp.hunks for l in h.lines if l[:1] == "-")
     global_attr = bool(_GLOBAL_ATTR.search(added) or _GLOBAL_ATTR.search(removed))
+    forced_import = _import_time_lines(fp, old_text, new_text, regions, touched, neighbors)
     for ln in sorted(touched | neighbors):
-        fn = regions.innermost(ln)
+        fn = None if ln in forced_import else regions.innermost(ln)
+        if fn is not None and regions.info.get(fn, ("",))[0] == "lambda" and maps.lambdas_traced:
+            if (rel, fn[2]) in maps.started_in_import:
+                fn = None  # the lambda itself ran at import time: its results are import-time state
+            else:
+                # tests that actually CALLED this lambda (its first line also runs when the
+                # enclosing table is built, so line coverage would over-select)
+                span_hit |= maps.lambda_callers(rel, fn[2])
+                plan.spans.append((rel, fn[0], fn[1]))
+                continue
         if fn is not None:
-            fs, fe, _ = fn
+            fs, fe = fn[0], fn[1]
             # A deterministic test can only behave differently if it executes the changed
             # statement (or reaches the insertion point). Use the statement's full span so
             # continuation lines without their own line events are still covered; fall back
@@ -499,6 +542,89 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
     plan.candidates |= hit
     kind = "module-level" if module_level else ("class " + ",".join(sorted(class_quals)) if class_quals else "runtime")
     plan.notes.append(f"{rel}: {kind} {len(hit)} cand")
+
+
+def _pair_lines(fp: FilePatch):
+    """Pair replaced lines positionally inside each -/+ block: (old->new, new->old, all '+' lines)."""
+    o2n: dict[int, int] = {}
+    n2o: dict[int, int] = {}
+    plus: set[int] = set()
+    for h in fp.hunks:
+        o = h.old_start if h.old_len > 0 else h.old_start + 1
+        n = h.new_start if h.new_len > 0 else h.new_start + 1
+        mb: list[int] = []
+        pb: list[int] = []
+
+        def flush():
+            for a, b in zip(mb, pb):
+                o2n[a] = b
+                n2o[b] = a
+            mb.clear()
+            pb.clear()
+
+        for l in h.lines:
+            t = l[:1]
+            if t == " ":
+                flush()
+                o += 1
+                n += 1
+            elif t == "-":
+                if pb:
+                    flush()
+                mb.append(o)
+                o += 1
+            elif t == "+":
+                pb.append(n)
+                plus.add(n)
+                n += 1
+        flush()
+    return o2n, n2o, plus
+
+
+def _import_time_lines(fp: FilePatch, old_text: str, new_text: str, regions: "Regions",
+                       touched: set[int], neighbors: set[int]) -> set[int]:
+    """Old line numbers whose change must be treated as import-time even though they sit in a
+    function/lambda region: text outside the body changed on a shared line (a dict key next to
+    a lambda, a one-line def's signature), or an added line lies outside any body."""
+    new_regions = Regions(new_text)
+    if not new_regions.ok:
+        return set(touched | neighbors)
+    old_l = old_text.split("\n")
+    new_l = new_text.split("\n")
+    o2n, n2o, plus = _pair_lines(fp)
+    forced: set[int] = set()
+    for ln in touched:
+        fn = regions.innermost(ln)
+        if fn is None or ln > len(old_l):
+            continue
+        seg_old = regions.outside_segments(fn, ln, old_l[ln - 1])
+        if seg_old is None:
+            continue
+        nl = o2n.get(ln)
+        if nl is None or nl > len(new_l):
+            forced.add(ln)
+            continue
+        fn1 = new_regions.innermost(nl)
+        seg_new = new_regions.outside_segments(fn1, nl, new_l[nl - 1]) if fn1 else ("<none>",)
+        if seg_new != seg_old:
+            forced.add(ln)
+    for nl in sorted(plus):
+        if nl > len(new_l):
+            continue
+        fn1 = new_regions.innermost(nl)
+        if fn1 is None:
+            return set(touched | neighbors)  # a new statement at module/class level
+        seg_new = new_regions.outside_segments(fn1, nl, new_l[nl - 1])
+        if seg_new is None:
+            continue
+        ol = n2o.get(nl)
+        if ol is None or ol > len(old_l):
+            return set(touched | neighbors)  # e.g. a new `"KEY": lambda ...` table entry
+        fn0 = regions.innermost(ol)
+        seg_old = regions.outside_segments(fn0, ol, old_l[ol - 1]) if fn0 else ("<none>",)
+        if seg_old != seg_new:
+            forced.add(ol)
+    return forced
 
 
 # Class attributes that feed global registries (e.g. SQL function name -> class); a change to

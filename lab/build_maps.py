@@ -79,6 +79,7 @@ def main(trace_dir: str, tests_json: str, out_path: str, case_dir: str | None = 
     tracked: set[str] = set()
     import_exec: dict[str, set[int]] = {}
     started: set[tuple] = set()
+    lambda_tests: dict[str, set[int]] = {}
     ok = []
     missing = []
     for t in tests:
@@ -107,6 +108,8 @@ def main(trace_dir: str, tests_json: str, out_path: str, case_dir: str | None = 
             for f, lns in src.items():
                 import_exec.setdefault(f, set()).update(lns)
         started.update(tuple(x) for x in d.get("started_in_import", []))
+        for f, ln in d.get("lambdas_run", []):
+            lambda_tests.setdefault(f"{f}:{ln}", set()).add(num)
         for c in d.get("types", []):
             class_tests.setdefault(c, set()).add(num)
         tracked.update(d.get("tracked", []))
@@ -126,6 +129,8 @@ def main(trace_dir: str, tests_json: str, out_path: str, case_dir: str | None = 
         "tracked": sorted(tracked),
         "import_exec": {f: sorted(v) for f, v in sorted(import_exec.items())},
         "started_in_import": sorted([list(x) for x in started]),
+        "lambda_tests": {k: intern(v) for k, v in sorted(lambda_tests.items())},
+        "lambdas_traced": True,
     }
     if case_dir:
         out["cases"] = _case_maps(case_dir, intern)
