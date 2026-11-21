@@ -55,6 +55,34 @@ class Maps:
         self.opened = d["opened"]
         self.class_tests = d.get("class_tests", {})
         self.tracked = set(d.get("tracked", []))
+        self.import_exec = {f: set(v) for f, v in d.get("import_exec", {}).items()}
+        # functions/lambdas that were actually called while some module was being imported
+        self.started_in_import = {(f, ln) for f, ln, _q in d.get("started_in_import", [])}
+        cases = d.get("cases") or {}
+        self.case_units = cases.get("units", [])
+        self.case_lines = cases.get("lines", {})
+        # test number -> {"BASE": uid, (file, k): uid}
+        self.case_index: dict[int, dict] = {}
+        for uid, u in enumerate(self.case_units):
+            num, f, k = u[0], u[1], u[2]
+            missing = len(u) > 3
+            ent = self.case_index.setdefault(num, {"files": {}, "missing": False})
+            ent["missing"] |= missing
+            if f == "BASE":
+                ent["BASE"] = uid
+            else:
+                ent["files"].setdefault(f, {})[k] = uid
+
+    def case_units_in_range(self, f: str, lo: int, hi: int) -> set[int]:
+        out: set[int] = set()
+        fl = self.case_lines.get(f)
+        if not fl:
+            return out
+        for ln in range(lo, hi + 1):
+            idx = fl.get(str(ln))
+            if idx is not None:
+                out.update(self.sets[idx])
+        return out
 
     def instance_tests(self, qual: str) -> set[int]:
         return set(self._s(self.class_tests.get(qual)))
@@ -147,8 +175,9 @@ class Regions:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 if node.body:
                     start = node.body[0].lineno
-                    # a decorator/signature line shares the def line; body may start on the def line
-                    self.funcs.append((start, node.end_lineno or start, node.lineno))
+                    # third field = the code object's co_firstlineno (first decorator line, if any)
+                    first = min([node.lineno] + [d.lineno for d in node.decorator_list])
+                    self.funcs.append((start, node.end_lineno or start, first))
             elif isinstance(node, ast.Lambda):
                 self.funcs.append((node.body.lineno, node.body.end_lineno or node.body.lineno, node.lineno))
             if isinstance(node, ast.stmt):
@@ -221,6 +250,16 @@ class Plan:
         self.candidates: set[int] = set()
         self.notes: list[str] = []
         self.fallback = False  # if True: list all candidates without verifying
+        # why tests are candidates (drives partial runs of case-driven tests)
+        self.cand_spans: set[int] = set()  # executed a changed statement inside a function
+        self.cand_other: set[int] = set()  # module/class-level, structural, other files
+        self.cand_fixture: dict[int, set[str]] = {}  # test -> changed fixture files it reads
+        self.spans: list[tuple[str, int, int]] = []
+        self.fixture_changes: list[tuple[str, str | None, str | None]] = []
+        self.hotswap = True  # every Python change is a runtime-only body change
+        self.hotswap_files: set[str] = set()
+        self.partial: dict[int, dict[str, set[int]]] = {}  # test -> fixture file -> case indices
+        self.cost_override: dict[int, float] = {}
 
 
 def read_src(rel: str) -> str | None:
@@ -273,7 +312,74 @@ def plan_commit(commit: str, text: str, maps: Maps, tests: list[dict]) -> Plan:
 
         for rel in dict.fromkeys(rels):
             _candidates_for_file(plan, maps, rel, fp, old_text, new_text)
+    if plan.fallback:
+        plan.hotswap = False
     return plan
+
+
+def _fixture_pairs(text: str | None):
+    """Mirror of tests/helpers.py load_sql_fixture_pairs (raw strings per case)."""
+    if text is None:
+        return None
+    s = "\n".join(line for line in text.splitlines() if line and not line.startswith("--"))
+    st = s.split(";")
+    return [(st[i].strip(), st[i + 1].strip()) for i in range(0, len(st), 2) if i + 1 < len(st)]
+
+
+def _changed_cases(old: str | None, new: str | None):
+    a, b = _fixture_pairs(old), _fixture_pairs(new)
+    if a is None or b is None or len(a) != len(b):
+        return None
+    return {i for i, (x, y) in enumerate(zip(a, b)) if x != y}
+
+
+def plan_partials(plan: Plan, maps: Maps, cpu_cost: list[float]) -> None:
+    """For slow case-driven tests, run only the fixture cases a change can reach.
+
+    Valid because a test fails iff one of its cases (or its case-independent part) fails, and a
+    deterministic case that never executes a changed statement behaves exactly as before.
+    """
+    fixture_text = {rel: (old, new) for rel, old, new in plan.fixture_changes}
+    span_hits = None
+    for n in sorted(plan.candidates):
+        ent = maps.case_index.get(n)
+        if not ent or ent["missing"] or n in plan.cand_other:
+            continue
+        sel: dict[str, set[int]] = {}
+        full = False
+        if n in plan.cand_spans:
+            if span_hits is None:
+                span_hits = set()
+                for rel, lo, hi in plan.spans:
+                    span_hits |= maps.case_units_in_range(rel, lo, hi)
+            if ent.get("BASE") in span_hits:
+                full = True
+            else:
+                found = False
+                for f, ks in ent["files"].items():
+                    for k, uid in ks.items():
+                        if uid in span_hits:
+                            sel.setdefault(f, set()).add(k)
+                            found = True
+                full = not found  # full trace says it runs the change but no case does: stay safe
+        if not full and n in plan.cand_fixture:
+            for rel in plan.cand_fixture[n]:
+                f = rel[len("tests/fixtures/"):]
+                changed = _changed_cases(*fixture_text.get(rel, (None, None)))
+                if f not in ent["files"] or not changed:
+                    full = True
+                    break
+                sel.setdefault(f, set()).update(changed)
+        if full or not sel:
+            continue
+        plan.partial[n] = sel
+        n_cases = sum(len(v) for v in ent["files"].values())
+        k = sum(len(v) for v in sel.values())
+        base = max(0.3, 0.15 * cpu_cost[n])
+        plan.cost_override[n] = base + (cpu_cost[n] - base) * k / max(1, n_cases)
+    if plan.partial:
+        plan.notes.append("partial " + ", ".join(
+            f"{n}:{sum(len(v) for v in s.values())}" for n, s in sorted(plan.partial.items())))
 
 
 def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_text, new_text):
@@ -281,15 +387,24 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
     in_pkg = rel.startswith("sqlglot/") or rel.startswith("tests/")
     if not is_py or not in_pkg:
         hit = maps.opened_tests(rel)
-        if fp.is_new or fp.is_deleted or fp.rename:
+        structural = fp.is_new or fp.is_deleted or fp.rename
+        if structural:
             d = os.path.dirname(rel)
             if d.startswith("tests/"):
                 hit |= maps.opened_in_dir(d)
         if is_py and not in_pkg:
             hit |= maps.module_tests(rel)
+            plan.hotswap = False
+        if not structural and not is_py and rel.startswith("tests/fixtures/"):
+            plan.fixture_changes.append((rel, old_text, new_text))
+            for n in hit:
+                plan.cand_fixture.setdefault(n, set()).add(rel)
+        else:
+            plan.cand_other |= hit
         plan.candidates |= hit
         plan.notes.append(f"file {rel}: {len(hit)} cand")
         return
+    plan.hotswap_files.add(os.path.join(SRC, rel))
 
     # python module inside sqlglot/ or tests/
     if fp.is_new and old_text is None:
@@ -300,17 +415,24 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
             if f.startswith(d + "/") and f.endswith("__init__.py"):
                 hit |= maps.module_tests(f)
         plan.candidates |= hit
+        plan.cand_other |= hit
+        plan.hotswap = False
         plan.notes.append(f"new module {rel}: {len(hit)} cand")
         return
     if fp.is_deleted or new_text is None:
         hit = maps.module_tests(rel)
         plan.candidates |= hit
+        plan.cand_other |= hit
+        plan.hotswap = False
         plan.notes.append(f"deleted module {rel}: {len(hit)} cand")
         return
     if rel != fp.old_path:
+        plan.hotswap = False
         return  # rename target handled via old path
     if python_semantically_equal(old_text, new_text):
         plan.notes.append(f"{rel}: comments/whitespace only")
+        plan.hotswap_files.discard(os.path.join(SRC, rel))
+        plan.patched.pop(os.path.join(SRC, rel), None)  # nothing to run differently
         return
     regions = Regions(old_text)
     new_ok = True
@@ -322,9 +444,13 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
     if not regions.ok or not new_ok:
         hit = maps.module_tests(rel)
         plan.candidates |= hit
+        plan.cand_other |= hit
+        plan.hotswap = False
         plan.notes.append(f"{rel}: syntax error -> module users {len(hit)}")
         return
     hit: set[int] = set()
+    span_hit: set[int] = set()
+    import_lines = maps.import_exec.get(rel, set())
     module_level = False
     class_quals: set[str] = set()
     modname = rel[:-3].replace("/", ".")
@@ -344,9 +470,16 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
             span = regions.stmt_span(ln)
             if span is None or span[0] < fs or span[1] > fe:
                 span = (fs, fe)
-            hit |= maps.lines_in_range(rel, span[0], span[1])
+            span_hit |= maps.lines_in_range(rel, span[0], span[1])
+            plan.spans.append((rel, span[0], span[1]))
+            # a changed statement that also ran while modules were being imported built
+            # import-time state; swapping the function body in a pre-imported process would
+            # not redo that, so such commits re-import instead
+            if (rel, fn[2]) in maps.started_in_import and                     any(l in import_lines for l in range(span[0], span[1] + 1)):
+                plan.hotswap = False
             continue
         # import-time line: class body (data/structure of one class) or module level
+        plan.hotswap = False
         where = regions.class_at(ln)
         if where is None or where[1] or global_attr:
             module_level = True
@@ -360,6 +493,9 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
         hit |= maps.instance_tests(q)
     if module_level:
         hit |= maps.module_tests(rel)
+    plan.cand_other |= hit
+    plan.cand_spans |= span_hit
+    hit |= span_hit
     plan.candidates |= hit
     kind = "module-level" if module_level else ("class " + ",".join(sorted(class_quals)) if class_quals else "runtime")
     plan.notes.append(f"{rel}: {kind} {len(hit)} cand")
@@ -418,16 +554,18 @@ def main() -> None:
             p.listed = set(p.candidates)
             cheap = []
         else:
-            verify, listed = choose_verify(p.candidates, dur_ms, cpu_cost)
+            plan_partials(p, maps, cpu_cost)
+            verify, listed = choose_verify(p.candidates, dur_ms, _Costs(cpu_cost, p.cost_override))
             p.listed = listed
             cheap = sorted(verify)
+            p.case_filter = _case_filter(p, set(cheap), maps)
         if cheap:
             jobs.append((p, cheap))
         else:
             results[p.commit] = set(p.listed)
 
     if jobs:
-        _preload()
+        _preload(sorted({ids[n].split("::")[0][:-3].replace("/", ".") for _, cheap in jobs for n in cheap}))
         _run_jobs(jobs, ids, dur_ms, results)
 
     for p in plans:
@@ -438,6 +576,34 @@ def main() -> None:
     me, ch = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
     cpu = me.ru_utime + me.ru_stime + ch.ru_utime + ch.ru_stime
     log(f"total {time.time()-t0:.2f}s wall, cpu {cpu:.2f}s (self+children)")
+
+
+class _Costs:
+    def __init__(self, base, override):
+        self.base, self.override = base, override
+
+    def __getitem__(self, n):
+        return self.override.get(n, self.base[n])
+
+
+def _case_filter(plan: Plan, run: set[int], maps: Maps) -> dict[str, list[int]]:
+    """fixture file -> case indices to load, for the partial tests that will actually run.
+
+    A file is filtered only if no other test that runs fully in the same child reads it.
+    """
+    filt: dict[str, set[int]] = {}
+    for n, sel in plan.partial.items():
+        if n in run:
+            for f, ks in sel.items():
+                filt.setdefault(f, set()).update(ks)
+    for f in list(filt):
+        readers = maps.opened_tests("tests/fixtures/" + f)
+        for t in readers & run:
+            if f not in plan.partial.get(t, {}):
+                del filt[f]
+                break
+    # a partial test whose file filter was dropped simply runs fully
+    return {f: sorted(ks) for f, ks in filt.items()}
 
 
 P_FAIL = 0.25  # rough chance that a candidate actually fails (only steers run-vs-list choices)
@@ -502,7 +668,8 @@ def _pack_cost(bins, dur_ms) -> int:
     return max(sum(dur_ms[n] for n in b) for b in bins) + WORKER_COST_MS * len(bins)
 
 
-def _preload():
+def _preload(test_modules=()):
+    """Import shared modules once in the parent so every forked child starts warm."""
     os.environ.setdefault("SKIP_INTEGRATION", "0")
     if SRC not in sys.path:
         sys.path.insert(0, SRC)
@@ -517,6 +684,12 @@ def _preload():
         import sqlglot.optimizer  # noqa: F401
     except Exception as e:
         log(f"preload failed: {e}")
+    import importlib
+    for m in test_modules:
+        try:
+            importlib.import_module(m)
+        except Exception as e:  # the child re-imports and reports it properly
+            log(f"preload {m} failed: {e!r}")
 
 
 def _run_jobs(jobs, ids, dur_ms, results):
@@ -536,8 +709,14 @@ def _run_jobs(jobs, ids, dur_ms, results):
                 try:
                     from runner import run_tests
                     timeouts = {ids[n]: max(1.0, 5 * dur_ms[n] / 1000) for n in cheap}
-                    failed = run_tests(SRC, [ids[n] for n in cheap], plan.patched, timeouts)
-                    payload = json.dumps(sorted(failed)).encode()
+                    import resource as _r
+                    stats = {}
+                    failed = run_tests(SRC, [ids[n] for n in cheap], plan.patched, timeouts, stats,
+                                       case_filter=getattr(plan, "case_filter", None),
+                                       hotswap=plan.hotswap)
+                    ru = _r.getrusage(_r.RUSAGE_SELF)
+                    stats["cpu"] = round(ru.ru_utime + ru.ru_stime, 3)
+                    payload = json.dumps({"failed": sorted(failed), "stats": stats}).encode()
                 except BaseException as e:  # noqa: BLE001
                     payload = json.dumps({"error": repr(e)}).encode()
                     code = 1
@@ -564,11 +743,14 @@ def _run_jobs(jobs, ids, dur_ms, results):
                 data = json.loads(b"".join(chunks).decode() or "null")
             except Exception:
                 data = None
-            if isinstance(data, list):
+            if isinstance(data, dict) and "failed" in data:
                 index = {t: i for i, t in enumerate(ids)}
-                failed = {index[t] for t in data if t in index}
+                failed = {index[t] for t in data["failed"] if t in index}
                 results[plan.commit] = set(plan.listed) | failed
-                plan.notes.append(f"verified {len(cheap)} in {time.time()-start:.1f}s -> {len(failed)} fail")
+                st = data.get("stats", {})
+                plan.notes.append(f"verified {len(cheap)} in {time.time()-start:.1f}s -> {len(failed)} fail "
+                                  f"[cpu {st.get('cpu')} setup {st.get('setup_cpu')} import {st.get('import_cpu')} "
+                                  f"mode {st.get('mode')} cases {st.get('case_filter')}]")
             else:
                 results[plan.commit] = set(plan.listed) | set(cheap)
                 plan.notes.append(f"child error {data!r}: listing all {len(cheap)}")

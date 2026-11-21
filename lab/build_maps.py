@@ -20,7 +20,43 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def main(trace_dir: str, tests_json: str, out_path: str) -> None:
+def _case_maps(case_dir: str, intern) -> dict:
+    """Per-case coverage of case-driven slow tests (lab/trace_cases.sh).
+
+    Pseudo-test ids index into `units`: [test_number, fixture_file or "BASE", case_index].
+    lines: {file: {line: set_index of pseudo-test ids}} (shares line_sets with the main map).
+    """
+    jobs = json.load(open(os.path.join(case_dir, "jobs.json")))
+    units, lines, missing = [], {}, 0
+    for i, (num, nid, case) in enumerate(jobs):
+        p = os.path.join(case_dir, f"{i}.json")
+        try:
+            d = json.load(open(p))
+        except (OSError, ValueError):
+            missing += 1
+            d = None
+        if case == "BASE":
+            unit = [int(num), "BASE", -1]
+        else:
+            f, k = case.rsplit("|", 1)
+            unit = [int(num), f, int(k)]
+        uid = len(units)
+        units.append(unit)
+        if d is None:
+            unit.append("missing")
+            continue
+        for f, lns in d["run"].items():
+            fl = lines.setdefault(f, {})
+            for ln in lns:
+                fl.setdefault(ln, set()).add(uid)
+    print(f"cases: units={len(units)} missing={missing}", file=sys.stderr)
+    return {
+        "units": units,
+        "lines": {f: {str(ln): intern(s) for ln, s in sorted(fl.items())} for f, fl in sorted(lines.items())},
+    }
+
+
+def main(trace_dir: str, tests_json: str, out_path: str, case_dir: str | None = None) -> None:
     tests = json.load(open(tests_json))["tests"]
     n = len(tests)
     set_index: dict[tuple, int] = {}
@@ -41,6 +77,8 @@ def main(trace_dir: str, tests_json: str, out_path: str) -> None:
     opened: dict[str, set[int]] = {}
     class_tests: dict[str, set[int]] = {}
     tracked: set[str] = set()
+    import_exec: dict[str, set[int]] = {}
+    started: set[tuple] = set()
     ok = []
     missing = []
     for t in tests:
@@ -64,6 +102,11 @@ def main(trace_dir: str, tests_json: str, out_path: str) -> None:
                 fl.setdefault(ln, set()).add(num)
         for f in d["import"]:
             mod_import.setdefault(f, set()).add(num)
+        # lines executed while modules were being imported (collection phase + lazy imports)
+        for src in (d["import"], d.get("import_exec", {})):
+            for f, lns in src.items():
+                import_exec.setdefault(f, set()).update(lns)
+        started.update(tuple(x) for x in d.get("started_in_import", []))
         for c in d.get("types", []):
             class_tests.setdefault(c, set()).add(num)
         tracked.update(d.get("tracked", []))
@@ -81,7 +124,11 @@ def main(trace_dir: str, tests_json: str, out_path: str) -> None:
         "outcome_ok": ok,
         "class_tests": {c: intern(s) for c, s in sorted(class_tests.items())},
         "tracked": sorted(tracked),
+        "import_exec": {f: sorted(v) for f, v in sorted(import_exec.items())},
+        "started_in_import": sorted([list(x) for x in started]),
     }
+    if case_dir:
+        out["cases"] = _case_maps(case_dir, intern)
     out["line_sets"] = sets
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with gzip.open(out_path, "wt", compresslevel=9) as fh:
@@ -93,4 +140,4 @@ def main(trace_dir: str, tests_json: str, out_path: str) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2], sys.argv[3])
+    main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else None)

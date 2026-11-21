@@ -223,20 +223,155 @@ class _Result(unittest.TestResult):
             self.bad.add(tid)
 
 
-def run_tests(src_root: str, test_ids: list[str], patched: dict[str, str | None], timeouts: dict[str, float]) -> set[str]:
+def _cpu():
+    import resource
+    r = resource.getrusage(resource.RUSAGE_SELF)
+    return r.ru_utime + r.ru_stime
+
+
+def _module_name(src_root: str, path: str) -> str:
+    rel = os.path.relpath(path, src_root)[:-3].replace(os.sep, "/").replace("/", ".")
+    return rel[: -len(".__init__")] if rel.endswith(".__init__") else rel
+
+
+def _code_objects(code, acc):
+    import types
+
+    for c in code.co_consts:
+        if isinstance(c, types.CodeType):
+            acc.append(c)
+            _code_objects(c, acc)
+    return acc
+
+
+def _keyed(codes):
+    seen: dict[str, int] = {}
+    out = {}
+    for c in codes:
+        i = seen.get(c.co_qualname, 0)
+        seen[c.co_qualname] = i + 1
+        out[(c.co_qualname, i)] = c
+    return out, seen
+
+
+def hot_swap(src_root: str, path: str, new_text: str) -> bool:
+    """Swap the code of every live function defined in `path` for its patched version.
+
+    Only used when every change is inside function bodies that never ran during an import
+    (the planner checks this against the import-time trace), so module and class state built
+    at import time is unaffected. Returns False (caller falls back to re-importing) whenever
+    the function structure differs or a live function cannot be matched.
+    """
+    import gc
+    import types
+
+    mod = sys.modules.get(_module_name(src_root, path))
+    if mod is None:
+        return True  # not imported yet: the patched finder serves the new source on import
+    if os.path.abspath(getattr(mod, "__file__", "") or "") != os.path.abspath(path):
+        return False
+    try:
+        with builtins.open(path, encoding="utf-8", newline="") as fh:
+            old_text = fh.read()
+        old_root = compile(old_text, path, "exec", dont_inherit=True)
+        new_root = compile(new_text, path, "exec", dont_inherit=True)
+    except (OSError, SyntaxError, ValueError):
+        return False
+    old_k, old_n = _keyed(_code_objects(old_root, []))
+    new_k, new_n = _keyed(_code_objects(new_root, []))
+    if old_n != new_n:
+        return False
+    by_pos = {}
+    for key, c in old_k.items():
+        pos = (c.co_qualname, c.co_firstlineno)
+        if pos in by_pos:
+            by_pos[pos] = None  # ambiguous (e.g. two lambdas on one line)
+        else:
+            by_pos[pos] = key
+    swaps = []
+    for f in gc.get_objects():
+        if type(f) is not types.FunctionType:
+            continue
+        code = f.__code__
+        if code.co_filename != path:
+            continue
+        key = by_pos.get((code.co_qualname, code.co_firstlineno))
+        if key is None:
+            return False
+        new = new_k[key]
+        if new.co_freevars != code.co_freevars:
+            return False
+        swaps.append((f, new))
+    for f, new in swaps:
+        f.__code__ = new
+    return True
+
+
+def _clear_caches():
+    import functools
+    import gc
+
+    for o in gc.get_objects():
+        if isinstance(o, functools._lru_cache_wrapper):
+            try:
+                o.cache_clear()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _install_case_filter(case_filter):
+    """Restrict tests/helpers.load_sql_fixture_pairs to the selected case indices per file."""
+    if not case_filter:
+        return None
+    sel = {f: set(ks) for f, ks in case_filter.items()}
+    import tests.helpers as helpers
+
+    orig = helpers.load_sql_fixture_pairs
+
+    def load_sql_fixture_pairs(filename, *args, **kwargs):
+        keep = sel.get(filename)
+        for i, item in enumerate(orig(filename, *args, **kwargs)):
+            if keep is None or i in keep:
+                yield item
+
+    helpers.load_sql_fixture_pairs = load_sql_fixture_pairs
+    return orig, load_sql_fixture_pairs
+
+
+def _rebind_filter(module, pair):
+    if pair and getattr(module, "load_sql_fixture_pairs", None) is pair[0]:
+        module.load_sql_fixture_pairs = pair[1]
+
+
+def run_tests(src_root: str, test_ids: list[str], patched: dict[str, str | None], timeouts: dict[str, float],
+              stats=None, case_filter=None, hotswap=False) -> set[str]:
     """Return the subset of test_ids that fail on the patched tree."""
+    stats = {} if stats is None else stats
+    c0 = _cpu()
     py_patched = {p: t for p, t in patched.items() if p.endswith(".py")}
     other_patched = {p: t for p, t in patched.items() if not p.endswith(".py")}
     deleted_py = {p for p, t in py_patched.items() if t is None}
 
     install_inline_executor()
     _install_file_overlay(other_patched)
+    mode = "none"
     if py_patched:
-        _purge_modules()
+        swapped = False
+        if hotswap and not deleted_py:
+            swapped = all(hot_swap(src_root, p, t) for p, t in py_patched.items())
+            if swapped:
+                _clear_caches()
+                mode = "hotswap"
+        if not swapped:
+            _purge_modules()
+            mode = "reimport"
         sys.meta_path.insert(0, _PatchedFinder(src_root, {p: t for p, t in py_patched.items() if t is not None}))
         if deleted_py:
             sys.meta_path.insert(0, _DeletedBlocker(src_root, deleted_py))
         importlib.invalidate_caches()
+    stats["mode"] = mode
+    filter_pair = _install_case_filter(case_filter)
+    stats["case_filter"] = {f: len(k) for f, k in (case_filter or {}).items()} or None
 
     failed: set[str] = set()
     by_module: dict[str, dict[str, list[tuple[str, str]]]] = {}
@@ -246,9 +381,14 @@ def run_tests(src_root: str, test_ids: list[str], patched: dict[str, str | None]
         by_module.setdefault(mod, {}).setdefault(cls, []).append((meth, tid))
 
     signal.signal(signal.SIGALRM, _alarm)
+    stats["setup_cpu"] = round(_cpu() - c0, 3)
+    imp = 0.0
     for mod, classes in by_module.items():
+        ci = _cpu()
         try:
             module = importlib.import_module(mod)
+            imp += _cpu() - ci
+            _rebind_filter(module, filter_pair)
         except BaseException:
             for cls, items in classes.items():
                 failed.update(tid for _, tid in items)
@@ -280,4 +420,5 @@ def run_tests(src_root: str, test_ids: list[str], patched: dict[str, str | None]
                 failed.update(t._xero_id for t in tests_in_suite)
             failed.update(b for b in res.bad if not b.startswith("__fixture__:"))
             unittest.suite._call_if_exists(res, "_restoreStdout")
+    stats["import_cpu"] = round(imp, 3)
     return failed

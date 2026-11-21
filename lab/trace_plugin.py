@@ -19,17 +19,46 @@ OUT = os.environ.get("TRACE_OUT")
 mon = sys.monitoring
 TOOL = 4
 _phase = "import"
-_lines = {"import": set(), "run": set()}
+_lines = {"import": set(), "run": set(), "import_exec": set()}
 _opened = {"import": set(), "run": set()}
+_importing = 0  # >0 while a sqlglot/tests module body is executing (module import)
 
 
 def _on_line(code, line):
     f = code.co_filename
     if f.startswith(ROOT):
+        key = (f[len(ROOT):], line)
         bucket = _lines.get(_phase)
         if bucket is not None:
-            bucket.add((f[len(ROOT):], line))
+            bucket.add(key)
+        if _importing:
+            _lines["import_exec"].add(key)
     return mon.DISABLE
+
+
+# Optional case filter for case-driven tests (fixture loaders in tests/helpers.py):
+#   TRACE_CASE unset         -> no filtering
+#   TRACE_CASE=BASE          -> every loader yields nothing (the test's case-independent part)
+#   TRACE_CASE=<file>|<k>    -> only case k of fixture <file>; other fixture files yield nothing
+_CASE = os.environ.get("TRACE_CASE")
+
+
+def _wrap_loader(orig):
+    def loader(filename, *args, **kwargs):
+        if _CASE is None:
+            yield from orig(filename, *args, **kwargs)
+            return
+        if _CASE == "BASE":
+            return
+        f, k = _CASE.rsplit("|", 1)
+        if filename != f:
+            return
+        for i, item in enumerate(orig(filename, *args, **kwargs)):
+            if i == int(k):
+                yield item
+
+    loader.__name__ = orig.__name__
+    return loader
 
 
 def _audit(event, args):
@@ -43,9 +72,23 @@ def _audit(event, args):
                 _opened[_phase].add(p[len(ROOT):])
 
 
+_started_in_import: set = set()  # (file, first line, qualname) of code that RAN during an import
+
+
+def _on_start(code, offset):
+    # module bodies run during collection ("import" phase) or lazily (inside _importing)
+    if _importing or _phase == "import":
+        f = code.co_filename
+        if f.startswith(ROOT):
+            _started_in_import.add((f[len(ROOT):], code.co_firstlineno, code.co_qualname))
+        return None
+    return mon.DISABLE
+
+
 mon.use_tool_id(TOOL, "blast-trace")
 mon.register_callback(TOOL, mon.events.LINE, _on_line)
-mon.set_events(TOOL, mon.events.LINE)
+mon.register_callback(TOOL, mon.events.PY_START, _on_start)
+mon.set_events(TOOL, mon.events.LINE | mon.events.PY_START)
 sys.addaudithook(_audit)
 
 _outcome = {}
@@ -100,17 +143,30 @@ def _wrap_module(module):
 
 class _WrapFinder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if not (fullname == "sqlglot" or fullname.startswith("sqlglot.")):
+        is_sqlglot = fullname == "sqlglot" or fullname.startswith("sqlglot.")
+        is_tests = fullname == "tests" or fullname.startswith("tests.")
+        if not (is_sqlglot or is_tests):
             return None
         spec = importlib.machinery.PathFinder.find_spec(fullname, path)
         if spec is None or spec.loader is None or not hasattr(spec.loader, "exec_module"):
             return spec
         orig = spec.loader.exec_module
 
-        def exec_module(module, _orig=orig):
-            _orig(module)
+        def exec_module(module, _orig=orig, _sq=is_sqlglot, _name=fullname):
+            global _importing
+            _importing += 1
+            mon.restart_events()  # so lines already seen elsewhere are reported again inside imports
             try:
-                _wrap_module(module)
+                _orig(module)
+            finally:
+                _importing -= 1
+            try:
+                if _sq:
+                    _wrap_module(module)
+                elif _name == "tests.helpers":
+                    for fn in ("load_sql_fixture_pairs", "load_sql_fixtures"):
+                        if hasattr(module, fn):
+                            setattr(module, fn, _wrap_loader(getattr(module, fn)))
             except Exception:  # noqa: BLE001
                 pass
 
@@ -185,6 +241,9 @@ def pytest_sessionfinish(session, exitstatus):
                 "import": pack(_lines["import"]),
                 "opened_run": sorted(_opened["run"]),
                 "opened_import": sorted(_opened["import"]),
+                "import_exec": pack(_lines["import_exec"]),
+                "started_in_import": sorted([list(x) for x in _started_in_import]),
+                "case": _CASE,
                 "types": sorted({_qual(c) for t in _types_seen for c in t.__mro__ if c.__module__.startswith("sqlglot")}),
                 "tracked": _tracked_classes(),
             },

@@ -1,0 +1,12 @@
+1106 tests/test_executor.py::TestExecutor::test_execute_tpcds optimizer/tpc-ds/tpc-ds.sql
+1107 tests/test_executor.py::TestExecutor::test_execute_tpch optimizer/tpc-h/tpc-h.sql
+1123 tests/test_executor.py::TestExecutor::test_optimized_tpch optimizer/tpc-h/tpc-h.sql
+1295 tests/test_optimizer.py::TestOptimizer::test_annotate_funcs optimizer/annotate_functions.sql
+1343 tests/test_optimizer.py::TestOptimizer::test_merge_subqueries optimizer/merge_subqueries.sql
+1355 tests/test_optimizer.py::TestOptimizer::test_optimize optimizer/optimizer.sql
+1382 tests/test_optimizer.py::TestOptimizer::test_qualify_columns optimizer/qualify_columns.sql
+1382 tests/test_optimizer.py::TestOptimizer::test_qualify_columns optimizer/qualify_columns_ddl.sql
+1434 tests/test_optimizer.py::TestOptimizer::test_simplify optimizer/simplify.sql
+1440 tests/test_optimizer.py::TestOptimizer::test_tpcds optimizer/tpc-ds/tpc-ds.sql
+1441 tests/test_optimizer.py::TestOptimizer::test_tpch optimizer/tpc-h/tpc-h.sql
+1454 tests/test_optimizer.py::TestOptimizer::test_unnest_subqueries optimizer/unnest_subqueries.sql
