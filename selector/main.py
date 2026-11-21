@@ -45,10 +45,26 @@ def log(*a):
 # ----------------------------------------------------------------------------- maps
 
 class Maps:
-    def __init__(self, path: str):
+    def __init__(self, path: str, runtime_ids: list[str] | None = None):
         with gzip.open(path, "rt") as fh:
             d = json.load(fh)
         self.sets = d["line_sets"]
+        self.test_ids = d["tests"]
+        # Maps are keyed by the test numbers of the tests.json they were built from. If the
+        # scorer's tests.json numbers tests differently, translate by test id; tests the maps
+        # do not know are treated as candidates for every code change (see plan_commit).
+        self.unknown_tests: set[int] = set()
+        if runtime_ids is not None and runtime_ids != self.test_ids:
+            pos = {t: i for i, t in enumerate(runtime_ids)}
+            remap = [pos.get(t) for t in self.test_ids]
+            nmap = len(remap)  # (sets that hold case-unit ids may exceed it; those are dropped below)
+            self.sets = [[remap[n] for n in st if n < nmap and remap[n] is not None] for st in self.sets]
+            known = {r for r in remap if r is not None}
+            self.unknown_tests = set(range(len(runtime_ids))) - known
+            self._remap = remap
+            self.test_ids = list(runtime_ids)
+        else:
+            self._remap = None
         self.lines = d["lines"]
         self.mod_run = d["mod_run"]
         self.mod_import = d["mod_import"]
@@ -60,13 +76,18 @@ class Maps:
         self.started_in_import = {(f, ln) for f, ln, _q in d.get("started_in_import", [])}
         self.lambda_tests = d.get("lambda_tests", {})
         self.lambdas_traced = bool(d.get("lambdas_traced"))
-        cases = d.get("cases") or {}
+        # case maps share line_sets but hold case-unit ids, not test numbers: unusable after a remap
+        cases = (d.get("cases") or {}) if self._remap is None else {}
         self.case_units = cases.get("units", [])
         self.case_lines = cases.get("lines", {})
         # test number -> {"BASE": uid, (file, k): uid}
         self.case_index: dict[int, dict] = {}
         for uid, u in enumerate(self.case_units):
             num, f, k = u[0], u[1], u[2]
+            if self._remap is not None:
+                num = self._remap[num] if num < len(self._remap) else None
+                if num is None:
+                    continue
             missing = len(u) > 3
             ent = self.case_index.setdefault(num, {"files": {}, "missing": False})
             ent["missing"] |= missing
@@ -347,6 +368,9 @@ def plan_commit(commit: str, text: str, maps: Maps, tests: list[dict]) -> Plan:
             _candidates_for_file(plan, maps, rel, fp, old_text, new_text)
     if plan.fallback:
         plan.hotswap = False
+    if maps.unknown_tests and plan.patched:
+        plan.candidates |= maps.unknown_tests
+        plan.cand_other |= maps.unknown_tests
     return plan
 
 
@@ -415,9 +439,39 @@ def plan_partials(plan: Plan, maps: Maps, cpu_cost: list[float]) -> None:
             f"{n}:{sum(len(v) for v in s.values())}" for n, s in sorted(plan.partial.items())))
 
 
+_PYTEST_CONFIG = {"pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml", ".pytest.ini"}
+
+
+def _pytest_config_change(rel: str, old_text, new_text) -> str | None:
+    """Directory whose tests a pytest configuration change can affect ('' = all), else None.
+
+    Our runner does not go through pytest, so these changes cannot be verified in memory.
+    """
+    base = os.path.basename(rel)
+    d = os.path.dirname(rel)
+    if base == "conftest.py":
+        return d
+    if base in _PYTEST_CONFIG and d == "":
+        if base in ("pytest.ini", ".pytest.ini", "tox.ini"):
+            return ""
+        txt = (old_text or "") + (new_text or "")
+        if "pytest" in txt:
+            return ""
+    return None
+
+
 def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_text, new_text):
     is_py = rel.endswith(".py")
     in_pkg = rel.startswith("sqlglot/") or rel.startswith("tests/")
+    scope = _pytest_config_change(rel, old_text, new_text)
+    if scope is not None:
+        hit = {n for n, t in enumerate(maps.test_ids) if t.startswith(scope + "/" if scope else "")}
+        plan.candidates |= hit
+        plan.cand_other |= hit
+        plan.fallback = True
+        plan.hotswap = False
+        plan.notes.append(f"pytest config {rel}: listing {len(hit)}")
+        return
     if not is_py or not in_pkg:
         hit = maps.opened_tests(rel)
         structural = fp.is_new or fp.is_deleted or fp.rename
@@ -661,7 +715,9 @@ def main() -> None:
     tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
     ids = [t["id"] for t in tests]
     dur_ms = [round(t["seconds"] * 1000) for t in tests]
-    maps = Maps(MAPS)
+    maps = Maps(MAPS, ids)
+    if maps.unknown_tests:
+        log(f"WARNING: {len(maps.unknown_tests)} tests not in maps; numbering remapped by id")
     commit_dir = os.path.join(DATA, "commits")
     commits = sorted(f[:-6] for f in os.listdir(commit_dir) if f.endswith(".patch"))
 
