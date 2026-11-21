@@ -977,9 +977,16 @@ def choose_verify(cands: set[int], dur_ms: list[int], cpu, pf=None):
     pf = pf or (lambda n: P_FAIL)
     MAX_RUN_S = 25.0  # keep any single verification well inside the batch time limit
     d = [x / 1000 for x in dur_ms]
-    # expensive runs need a clear expected win (they are high-variance: run AND list if it fails)
-    must_list = {n for n in cands if cpu[n] > MAX_RUN_S
-                 or cpu[n] + pf(n) * d[n] > (0.8 if cpu[n] > 2.0 else 1.0) * (d[n] + 2.0)}
+    # 1) tests that are never worth running (even listed on a worker of their own)
+    must_list = {n for n in cands if cpu[n] > MAX_RUN_S or cpu[n] + pf(n) * d[n] > d[n] + 2.0}
+    # 2) expensive-but-runnable tests: compare against the MARGINAL cost of listing them next to
+    #    what is listed anyway (a 29 s test beside a 21 s one adds ~8 s, not 31 s); expensive runs
+    #    also need a clear expected win since they are high-variance (run AND list if it fails)
+    for n in sorted((n for n in cands - must_list if cpu[n] > 1.0), key=lambda n: -dur_ms[n]):
+        base = _pack_cost(split_workers(sorted(must_list), dur_ms), dur_ms) / 1000 if must_list else 0.0
+        with_n = _pack_cost(split_workers(sorted(must_list | {n}), dur_ms), dur_ms) / 1000
+        if cpu[n] + pf(n) * d[n] > 0.8 * (with_n - base):
+            must_list.add(n)
     rest = cands - must_list
     if must_list:
         # the 2 s worker fee is paid anyway: list whatever is cheaper to list than to run,
