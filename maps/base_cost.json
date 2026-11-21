@@ -1,0 +1,13 @@
+{
+"tests/test_executor.py::TestExecutor::test_execute_tpcds": 1.935,
+"tests/test_executor.py::TestExecutor::test_execute_tpch": 1.56,
+"tests/test_executor.py::TestExecutor::test_optimized_tpch": 1.479,
+"tests/test_optimizer.py::TestOptimizer::test_annotate_funcs": 0.371,
+"tests/test_optimizer.py::TestOptimizer::test_merge_subqueries": 0.36,
+"tests/test_optimizer.py::TestOptimizer::test_optimize": 0.377,
+"tests/test_optimizer.py::TestOptimizer::test_qualify_columns": 0.459,
+"tests/test_optimizer.py::TestOptimizer::test_simplify": 0.455,
+"tests/test_optimizer.py::TestOptimizer::test_tpcds": 0.356,
+"tests/test_optimizer.py::TestOptimizer::test_tpch": 0.361,
+"tests/test_optimizer.py::TestOptimizer::test_unnest_subqueries": 0.353
+}

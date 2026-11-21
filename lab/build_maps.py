@@ -20,6 +20,21 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+def _cmp_ok(cmp_dir: str) -> list[str]:
+    """Comparison sites where `is` and `==` (or `is not` and `!=`) never disagreed (lab/cmp_plugin.py)."""
+    stats: dict[str, list[int]] = {}
+    for f in os.listdir(cmp_dir):
+        if not f.startswith("cmp."):
+            continue
+        for k, (n, bad) in json.load(open(os.path.join(cmp_dir, f))).items():
+            st = stats.setdefault(k, [0, 0])
+            st[0] += n
+            st[1] += bad
+    ok = sorted(k for k, (n, bad) in stats.items() if n > 0 and bad == 0)
+    print(f"cmp: sites={len(stats)} ok={len(ok)} disagreeing={sum(1 for v in stats.values() if v[1])}", file=sys.stderr)
+    return ok
+
+
 def _case_maps(case_dir: str, intern) -> dict:
     """Per-case coverage of case-driven slow tests (lab/trace_cases.sh).
 
@@ -134,6 +149,9 @@ def main(trace_dir: str, tests_json: str, out_path: str, case_dir: str | None = 
     }
     if case_dir:
         out["cases"] = _case_maps(case_dir, intern)
+    cmp_dir = os.environ.get("CMP_DIR")
+    if cmp_dir:
+        out["cmp_ok"] = _cmp_ok(cmp_dir)
     out["line_sets"] = sets
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with gzip.open(out_path, "wt", compresslevel=9) as fh:

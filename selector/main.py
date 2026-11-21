@@ -34,7 +34,9 @@ DATA = os.environ.get("DATA_DIR", "/data")
 MAPS = os.environ.get("BLAST_MAPS", os.path.join(HERE, "..", "maps", "coverage.json.gz"))
 HEAVY_S = float(os.environ.get("BLAST_HEAVY_S", "1.0"))  # tests slower than this are listed, not run
 PARALLEL = int(os.environ.get("BLAST_PAR", "2"))
-CHILD_LIMIT_S = float(os.environ.get("BLAST_CHILD_LIMIT", "75"))
+CHILD_LIMIT_S = float(os.environ.get("BLAST_CHILD_LIMIT", "60"))
+# The scorer allows 3 minutes for the whole batch (4.5 in the final). Stop verifying well before.
+DEADLINE = time.monotonic() + float(os.environ.get("BLAST_BUDGET_S", "130"))
 WORKER_COST_MS = 2000
 
 
@@ -76,6 +78,7 @@ class Maps:
         self.started_in_import = {(f, ln) for f, ln, _q in d.get("started_in_import", [])}
         self.lambda_tests = d.get("lambda_tests", {})
         self.lambdas_traced = bool(d.get("lambdas_traced"))
+        self.cmp_ok = set(d.get("cmp_ok", []))
         # case maps share line_sets but hold case-unit ids, not test numbers: unusable after a remap
         cases = (d.get("cases") or {}) if self._remap is None else {}
         self.case_units = cases.get("units", [])
@@ -432,14 +435,16 @@ def plan_partials(plan: Plan, maps: Maps, cpu_cost: list[float]) -> None:
         plan.partial[n] = sel
         n_cases = sum(len(v) for v in ent["files"].values())
         k = sum(len(v) for v in sel.values())
-        base = max(0.3, 0.15 * cpu_cost[n])
-        plan.cost_override[n] = base + (cpu_cost[n] - base) * k / max(1, n_cases)
+        base = _BASE_COST.get(maps.test_ids[n], max(0.3, 0.15 * cpu_cost[n]))
+        plan.cost_override[n] = base + max(0.0, cpu_cost[n] - base) * k / max(1, n_cases)
     if plan.partial:
         plan.notes.append("partial " + ", ".join(
             f"{n}:{sum(len(v) for v in s.values())}" for n, s in sorted(plan.partial.items())))
 
 
 _PYTEST_CONFIG = {"pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml", ".pytest.ini"}
+# package directories that some test walks with pkgutil (so a new module there gets imported)
+_DISCOVERY = {"sqlglot/typing/": "tests/test_typing.py::", "sqlglot/": "tests/test_docs.py::"}
 
 
 def _pytest_config_change(rel: str, old_text, new_text) -> str | None:
@@ -475,10 +480,8 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
     if not is_py or not in_pkg:
         hit = maps.opened_tests(rel)
         structural = fp.is_new or fp.is_deleted or fp.rename
-        if structural:
-            d = os.path.dirname(rel)
-            if d.startswith("tests/"):
-                hit |= maps.opened_in_dir(d)
+        # (a brand-new non-Python file is only read if some test names it or lists its directory;
+        #  no test at the pinned commit lists a fixture directory, so `opened_tests` is complete)
         if is_py and not in_pkg:
             hit |= maps.module_tests(rel)
             plan.hotswap = False
@@ -495,12 +498,14 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
 
     # python module inside sqlglot/ or tests/
     if fp.is_new and old_text is None:
-        # brand-new module: only matters if something imports it (other hunks) or a test lists the package
-        d = os.path.dirname(rel)
+        # A brand-new module only runs if something imports it: a changed file (analysed on its
+        # own as a module-level change) or a test that discovers modules by listing a package
+        # directory (pkgutil). At the pinned commit only tests/test_typing.py does that, for
+        # sqlglot/typing/. Being importable by name, it also shadows nothing that exists.
         hit = set()
-        for f in list(maps.mod_import.keys()) + list(maps.mod_run.keys()):
-            if f.startswith(d + "/") and f.endswith("__init__.py"):
-                hit |= maps.module_tests(f)
+        for d, prefix in _DISCOVERY.items():
+            if rel.startswith(d):
+                hit |= {n for n, t in enumerate(maps.test_ids) if t.startswith(prefix)}
         plan.candidates |= hit
         plan.cand_other |= hit
         plan.hotswap = False
@@ -520,6 +525,11 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
         plan.notes.append(f"{rel}: comments/whitespace only")
         plan.hotswap_files.discard(os.path.join(SRC, rel))
         plan.patched.pop(os.path.join(SRC, rel), None)  # nothing to run differently
+        return
+    if maps.cmp_ok and _only_equivalent_swaps(fp, old_text, new_text, rel, maps.cmp_ok):
+        plan.notes.append(f"{rel}: is/== swaps at sites where both forms always agreed")
+        plan.hotswap_files.discard(os.path.join(SRC, rel))
+        plan.patched.pop(os.path.join(SRC, rel), None)
         return
     regions = Regions(old_text)
     new_ok = True
@@ -596,6 +606,49 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
     plan.candidates |= hit
     kind = "module-level" if module_level else ("class " + ",".join(sorted(class_quals)) if class_quals else "runtime")
     plan.notes.append(f"{rel}: {kind} {len(hit)} cand")
+
+
+_SWAPS = {("is", "=="): ("is", "eq"), ("==", "is"): ("eq", "is"),
+          ("isnot", "!="): ("isnot", "noteq"), ("!=", "isnot"): ("noteq", "isnot")}
+
+
+def _only_equivalent_swaps(fp: FilePatch, old_text: str, new_text: str, rel: str, cmp_ok: set[str]) -> bool:
+    """True if every change in this file swaps `is`<->`==` / `is not`<->`!=` in one comparison,
+    at a site where (over every execution in the whole test suite, measured by lab/cmp_plugin.py)
+    the identity and equality forms always gave the same answer. Then no test can change."""
+    o2n, n2o, plus = _pair_lines(fp)
+    n_minus = sum(1 for h in fp.hunks for l in h.lines if l[:1] == "-")
+    if not o2n or n_minus != len(o2n) or len(plus) != len(n2o):
+        return False  # only 1:1 line replacements qualify
+    try:
+        tree = ast.parse(old_text)
+    except SyntaxError:
+        return False
+    compares = [n for n in ast.walk(tree) if isinstance(n, ast.Compare) and len(n.ops) == 1]
+    old_l, new_l = old_text.split("\n"), new_text.split("\n")
+    for ol, nl in o2n.items():
+        a, b = old_l[ol - 1], new_l[nl - 1]
+        if not a.isascii() or not b.isascii():
+            return False
+        p = 0
+        while p < min(len(a), len(b)) and a[p] == b[p]:
+            p += 1
+        s = 0
+        while s < min(len(a), len(b)) - p and a[len(a) - 1 - s] == b[len(b) - 1 - s]:
+            s += 1
+        kinds = _SWAPS.get((a[p:len(a) - s].replace(" ", ""), b[p:len(b) - s].replace(" ", "")))
+        if kinds is None:
+            return False
+        want = {"is": ast.Is, "eq": ast.Eq, "isnot": ast.IsNot, "noteq": ast.NotEq}[kinds[0]]
+        pos = (ol, p)
+        hits = [c for c in compares if isinstance(c.ops[0], want)
+                and (c.lineno, c.col_offset) <= pos <= (c.end_lineno or c.lineno, c.end_col_offset or 0)]
+        if len(hits) != 1:
+            return False
+        c = hits[0]
+        if f"{rel}:{c.lineno}:{c.col_offset}:{kinds[0]}" not in cmp_ok:
+            return False
+    return True
 
 
 def _pair_lines(fp: FilePatch):
@@ -781,12 +834,23 @@ def _case_filter(plan: Plan, run: set[int], maps: Maps) -> dict[str, list[int]]:
     for f in list(filt):
         readers = maps.opened_tests("tests/fixtures/" + f)
         for t in readers & run:
-            if f not in plan.partial.get(t, {}):
+            if f in plan.partial.get(t, {}):
+                continue
+            # TestExecutor.setUpClass loads both TPC case lists for every executor test, but only
+            # the case-driven ones (in case_index) iterate them; other executor tests are unaffected
+            iterates = f in maps.case_index.get(t, {}).get("files", {}) or                 not maps.test_ids[t].startswith("tests/test_executor.py::")
+            if iterates:
                 del filt[f]
                 break
     # a partial test whose file filter was dropped simply runs fully
     return {f: sorted(ks) for f, ks in filt.items()}
 
+
+try:  # measured CPU of each case-driven test with no cases (lab/measure_base.py)
+    with open(os.path.join(os.path.dirname(MAPS), "base_cost.json")) as _fh:
+        _BASE_COST = json.load(_fh)
+except (OSError, ValueError):
+    _BASE_COST = {}
 
 P_FAIL = 0.25  # rough chance that a candidate actually fails (only steers run-vs-list choices)
 
@@ -825,16 +889,19 @@ def choose_verify(cands: set[int], dur_ms: list[int], cpu: list[float]):
     if must_list:
         # the 2 s worker fee is paid anyway: list whatever is cheaper to list than to run,
         # as long as it does not lengthen the busiest worker
-        base = split_workers(sorted(must_list), dur_ms)
-        base_cost = _pack_cost(base, dur_ms)
+        bins = split_workers(sorted(must_list), dur_ms)
+        loads = [sum(dur_ms[n] for n in b) for b in bins]
+        cur_max = max(loads)
         listed = set(must_list)
         for n in sorted(rest, key=lambda n: -dur_ms[n]):
-            if cpu[n] <= dur_ms[n] / 1000:
-                continue
-            trial = split_workers(sorted(listed | {n}), dur_ms)
-            if (_pack_cost(trial, dur_ms) - base_cost) / 1000 <= cpu[n] * (1 - P_FAIL):
+            i = loads.index(min(loads))
+            new_max = max(cur_max, loads[i] + dur_ms[n])
+            marginal = (new_max - cur_max) / 1000
+            # list it when that is free (fits under the busiest worker) or cheaper than running it
+            if marginal <= 0 or marginal <= cpu[n] * (1 - P_FAIL):
+                loads[i] += dur_ms[n]
+                cur_max = new_max
                 listed.add(n)
-                base_cost = _pack_cost(trial, dur_ms)
         return rest - listed, listed
     # nothing must be listed: either run everything, or list everything without running
     run_cost = sum(cpu[n] for n in rest)
@@ -881,6 +948,12 @@ def _run_jobs(jobs, ids, dur_ms, results):
     pending = list(jobs)
     running = {}  # pid -> (plan, cheap, rfd, start, chunks)
     while pending or running:
+        # global wall-clock budget: past it, stop verifying and list every remaining candidate
+        if pending and time.monotonic() > DEADLINE:
+            for plan, cheap in pending:
+                results[plan.commit] = set(plan.listed) | set(cheap)
+                plan.notes.append("deadline: listing all")
+            pending = []
         while pending and len(running) < PARALLEL:
             plan, cheap = pending.pop(0)
             r, w = os.pipe()
@@ -939,7 +1012,7 @@ def _run_jobs(jobs, ids, dur_ms, results):
         # enforce time limits
         now = time.time()
         for pid, (plan, cheap, fd, start, chunks) in list(running.items()):
-            if now - start > CHILD_LIMIT_S:
+            if now - start > CHILD_LIMIT_S or time.monotonic() > DEADLINE + 15:
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
