@@ -97,4 +97,12 @@ for cid in miss:
     f = labels[cid]
     sel = {n for w in outputs[cid] for n in w}
     print("MISS", cid, kinds[cid], "missed:", [tests[n]["id"] for n in sorted(f - sel)][:5])
-json.dump({"misses": miss}, open(os.path.join(WORK, "summary.json"), "w"))
+per = {}
+for cid in cids:
+    w = outputs.get(cid)
+    if w is None:
+        continue
+    per[cid] = {"kind": kinds[cid], "workers": w, "failing": sorted(labels[cid]),
+                "cost": max([sum(ms[n] for n in x) for x in w] or [0]) + 2000 * len([x for x in w if x]),
+                "oracle": oracle(labels[cid])}
+json.dump({"misses": miss, "per": per}, open(os.path.join(WORK, "summary.json"), "w"))

@@ -39,6 +39,8 @@ CHILD_LIMIT_S = float(os.environ.get("BLAST_CHILD_LIMIT", "60"))
 DEADLINE = time.monotonic() + float(os.environ.get("BLAST_BUDGET_S", "130"))
 WORKER_COST_MS = 2000
 MAX_NODES_N = None
+PROBE_SWEEP: list[str] = []
+MAPS_OBJ = None
 
 
 def log(*a):
@@ -78,6 +80,18 @@ class Maps:
         # functions/lambdas that were actually called while some module was being imported
         self.started_in_import = {(f, ln) for f, ln, _q in d.get("started_in_import", [])}
         self.lambda_tests = d.get("lambda_tests", {})
+        # import-time execution (lab/import_trace.py): line -> modules whose import ran it, and
+        # test file -> modules imported when pytest collects it
+        self.imp_mods: list[str] = []
+        self.imp_lines: dict = {}
+        self.collect: dict[str, set[str]] = {}
+        try:
+            with gzip.open(os.path.join(os.path.dirname(path), "imports.json.gz"), "rt") as fh:
+                di = json.load(fh)
+            self.imp_mods, self.imp_lines = di["modules"], di["lines"]
+            self.collect = {f: set(v) for f, v in di["collect"].items()}
+        except (OSError, ValueError, KeyError):
+            pass
         self.lambdas_traced = bool(d.get("lambdas_traced"))
         self.cmp_ok = set(d.get("cmp_ok", []))
         self.name_uses = d.get("name_uses", {})
@@ -101,6 +115,43 @@ class Maps:
                 ent["BASE"] = uid
             else:
                 ent["files"].setdefault(f, {})[k] = uid
+
+    def file_tests(self, f: str) -> list[int]:
+        ft = getattr(self, "_file_tests", None)
+        if ft is None:
+            ft = self._file_tests = {}
+            for n, t in enumerate(self.test_ids):
+                ft.setdefault(t.split("::")[0], []).append(n)
+        return ft.get(f, [])
+
+    def import_modules_at(self, f: str, lines) -> set[str]:
+        """Modules whose import executes any of these lines of file f."""
+        fl = self.imp_lines.get(f)
+        if not fl:
+            return set()
+        out = set()
+        for ln in lines:
+            for i in fl.get(str(ln), ()):
+                out.add(self.imp_mods[i])
+        return out
+
+    def collect_importers(self, mod: str) -> set[str]:
+        """Test modules whose collection imports `mod`."""
+        return {_modname(f) for f, ms in self.collect.items() if mod in ms}
+
+    def broken_tests(self, mods) -> set[int]:
+        """Tests that cannot pass when these modules fail to import: tests in every file whose
+        collection imports one of them (pytest reports the whole file as an error), plus tests
+        that ran or imported them at run time."""
+        mods = set(mods)
+        out: set[int] = set()
+        for m in mods:
+            rel = m.replace(".", "/")
+            out |= self.module_tests(rel + ".py") | self.module_tests(rel + "/__init__.py")
+        for f, ms in self.collect.items():
+            if ms & mods:
+                out.update(self.file_tests(f))
+        return out
 
     def lambda_callers(self, f: str, first_line: int) -> set[int]:
         return set(self._s(self.lambda_tests.get(f"{f}:{first_line}")))
@@ -154,6 +205,11 @@ class Maps:
             if f.startswith(prefix):
                 out.update(self.sets[idx])
         return out
+
+
+def _modname(rel: str) -> str:
+    m = rel[:-3].replace("/", ".")
+    return m[: -len(".__init__")] if m.endswith(".__init__") else m
 
 
 # ----------------------------------------------------------------------------- python analysis
@@ -320,6 +376,9 @@ class Plan:
         self.hotswap_files: set[str] = set()
         self.partial: dict[int, dict[str, set[int]]] = {}  # test -> fixture file -> case indices
         self.cost_override: dict[int, float] = {}
+        # modules to re-import under the patch before running anything: if one now fails to
+        # import, every test whose file imports it at collection fails (see Maps.broken_tests)
+        self.probe: set[str] = set()
 
 
 def read_src(rel: str) -> str | None:
@@ -514,12 +573,16 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
         plan.hotswap = False
         plan.notes.append(f"new module {rel}: {len(hit)} cand")
         return
-    if fp.is_deleted or new_text is None:
+    moved_away = bool(fp.old_path and fp.new_path and fp.old_path != fp.new_path and rel == fp.old_path)
+    if fp.is_deleted or new_text is None or moved_away:
+        # the module disappears: its users fail unless the patch also updates them; test files
+        # that import it at collection are re-imported under the patch to find out
         hit = maps.module_tests(rel)
         plan.candidates |= hit
         plan.cand_other |= hit
         plan.hotswap = False
-        plan.notes.append(f"deleted module {rel}: {len(hit)} cand")
+        plan.probe |= maps.collect_importers(_modname(rel))
+        plan.notes.append(f"{'moved' if moved_away else 'deleted'} module {rel}: {len(hit)} cand")
         return
     if rel != fp.old_path:
         plan.hotswap = False
@@ -542,7 +605,7 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
         new_ok = False
     touched, neighbors = changed_old_lines(fp)
     if not regions.ok or not new_ok:
-        hit = maps.module_tests(rel)
+        hit = maps.module_tests(rel) | (maps.broken_tests({_modname(rel)}) if not new_ok else set())
         plan.candidates |= hit
         plan.cand_other |= hit
         plan.hotswap = False
@@ -560,6 +623,22 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
     removed = "\n".join(l[1:] for h in fp.hunks for l in h.lines if l[:1] == "-")
     global_attr = bool(_GLOBAL_ATTR.search(added) or _GLOBAL_ATTR.search(removed))
     forced_import = _import_time_lines(fp, old_text, new_text, regions, touched, neighbors)
+    # changed code that runs while some module is imported (module/class level, or a function a
+    # class body calls, e.g. a parser method behind a pre-parsed constant): re-import those
+    # modules under the patch. Insertion points count when inside a body or at module level;
+    # a def header next to an insertion at the top of a body does not.
+    probe_lines = touched | (neighbors & forced_import) | \
+        {ln for ln in neighbors if regions.innermost(ln) is not None}
+    # whole statements: a changed continuation line may only have been skipped at import time
+    # (`if a and b` with a falsy `a`) while the statement itself ran
+    for ln in list(probe_lines):
+        sp = regions.stmt_span(ln)
+        if sp is not None:
+            probe_lines.update(range(sp[0], sp[1] + 1))
+    probe = maps.import_modules_at(rel, probe_lines)
+    if probe:
+        plan.probe |= probe
+        plan.hotswap = False
     for ln in sorted(touched | neighbors):
         fn = None if ln in forced_import else regions.innermost(ln)
         if fn is not None and regions.info.get(fn, ("",))[0] == "lambda" and maps.lambdas_traced:
@@ -601,6 +680,8 @@ def _candidates_for_file(plan: Plan, maps: Maps, rel: str, fp: FilePatch, old_te
             module_level = True
     for q in class_quals:
         hit |= maps.instance_tests(q)
+    if module_level and rel.startswith("sqlglot/") and _IMPORT_LINE.search(added + "\n" + removed):
+        hit |= {n for n, t in enumerate(maps.test_ids) if t in SUBPROCESS_TESTS}
     if module_level:
         narrowed = _module_constant_tests(fp, old_text, new_text, rel, maps)
         if narrowed is None:
@@ -813,6 +894,11 @@ def _import_time_lines(fp: FilePatch, old_text: str, new_text: str, regions: "Re
 import re as _re  # noqa: E402
 
 _GLOBAL_ATTR = _re.compile(r"^\s*(_sql_names|key)\s*[:=]", _re.M)
+_IMPORT_LINE = _re.compile(r"^\s*(import|from)\s+\S", _re.M)
+
+# Tests that run sqlglot in a separate interpreter (subprocess): the in-memory patch does not
+# reach it, so running them here proves nothing; they are listed whenever they are candidates.
+SUBPROCESS_TESTS = {"tests/dialects/test_dialect.py::TestDialect::test_lazy_load"}
 
 
 # ----------------------------------------------------------------------------- execution
@@ -873,14 +959,20 @@ def main() -> None:
             if p.scaled and MAX_NODES_N is not None:
                 p.cost_override[MAX_NODES_N] = 1.2
             verify, listed = choose_verify(p.candidates, dur_ms, _Costs(cpu_cost, p.cost_override), pfail)
+            never = {n for n in verify if ids[n] in SUBPROCESS_TESTS}
+            verify -= never
+            listed |= never
             p.listed = listed
             cheap = sorted(verify)
             p.case_filter = _case_filter(p, set(cheap), maps)
-        if cheap:
+        if cheap or (p.probe and not p.fallback):
             jobs.append((p, cheap))
         else:
             results[p.commit] = set(p.listed)
 
+    global PROBE_SWEEP, MAPS_OBJ
+    PROBE_SWEEP = sorted(set(maps.imp_mods) | {m for ms in maps.collect.values() for m in ms})
+    MAPS_OBJ = maps
     if jobs:
         _preload(sorted({ids[n].split("::")[0][:-3].replace("/", ".") for _, cheap in jobs for n in cheap}))
         _run_jobs(jobs, ids, dur_ms, results)
@@ -1090,10 +1182,12 @@ def _run_jobs(jobs, ids, dur_ms, results):
                     stats = {}
                     failed = run_tests(SRC, [ids[n] for n in cheap], plan.patched, timeouts, stats,
                                        case_filter=getattr(plan, "case_filter", None),
-                                       hotswap=plan.hotswap, scaled=getattr(plan, "scaled", False))
+                                       hotswap=plan.hotswap, scaled=getattr(plan, "scaled", False),
+                                       probe=sorted(plan.probe), sweep=PROBE_SWEEP)
                     ru = _r.getrusage(_r.RUSAGE_SELF)
                     stats["cpu"] = round(ru.ru_utime + ru.ru_stime, 3)
-                    payload = json.dumps({"failed": sorted(failed), "stats": stats}).encode()
+                    payload = json.dumps({"failed": sorted(failed), "broken": stats.pop("broken", []),
+                                          "stats": stats}).encode()
                 except BaseException as e:  # noqa: BLE001
                     payload = json.dumps({"error": repr(e)}).encode()
                     code = 1
@@ -1124,10 +1218,16 @@ def _run_jobs(jobs, ids, dur_ms, results):
                 index = {t: i for i, t in enumerate(ids)}
                 failed = {index[t] for t in data["failed"] if t in index}
                 results[plan.commit] = set(plan.listed) | failed
+                if data.get("broken"):
+                    bt = MAPS_OBJ.broken_tests(data["broken"])
+                    results[plan.commit] |= bt
+                    more = "..." if len(data["broken"]) > 4 else ""
+                    plan.notes.append(f"import broken {data['broken'][:4]}{more}: +{len(bt)} listed")
                 st = data.get("stats", {})
                 plan.notes.append(f"verified {len(cheap)} in {time.time()-start:.1f}s -> {len(failed)} fail "
                                   f"[cpu {st.get('cpu')} setup {st.get('setup_cpu')} import {st.get('import_cpu')} "
-                                  f"mode {st.get('mode')} cases {st.get('case_filter')}]")
+                                  f"mode {st.get('mode')} cases {st.get('case_filter')} "
+                                  f"probe {len(plan.probe)}/{st.get('probe_cpu')}]")
             else:
                 results[plan.commit] = set(plan.listed) | set(cheap)
                 plan.notes.append(f"child error {data!r}: listing all {len(cheap)}")

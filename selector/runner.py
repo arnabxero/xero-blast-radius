@@ -371,9 +371,26 @@ def _rebind_filter(module, pair):
         module.load_sql_fixture_pairs = pair[1]
 
 
+def _probe_import(name: str, limit_s: float = 10.0) -> bool:
+    """Import `name` (fresh, under the patch); False if that raises or hangs."""
+    old = signal.signal(signal.SIGALRM, _alarm)
+    signal.setitimer(signal.ITIMER_REAL, limit_s, 0)
+    try:
+        importlib.import_module(name)
+        return True
+    except BaseException:  # noqa: BLE001
+        return False
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+
+
 def run_tests(src_root: str, test_ids: list[str], patched: dict[str, str | None], timeouts: dict[str, float],
-              stats=None, case_filter=None, hotswap=False, scaled=False) -> set[str]:
-    """Return the subset of test_ids that fail on the patched tree."""
+              stats=None, case_filter=None, hotswap=False, scaled=False, probe=(), sweep=()) -> set[str]:
+    """Return the subset of test_ids that fail on the patched tree.
+
+    probe: modules to import first; any that fail are reported in stats["broken"] (then every
+    module in `sweep` is tried too, to find everything that depends on them)."""
     stats = {} if stats is None else stats
     c0 = _cpu()
     py_patched = {p: t for p, t in patched.items() if p.endswith(".py")}
@@ -398,6 +415,14 @@ def run_tests(src_root: str, test_ids: list[str], patched: dict[str, str | None]
             sys.meta_path.insert(0, _DeletedBlocker(src_root, deleted_py))
         importlib.invalidate_caches()
     stats["mode"] = mode
+    if probe:
+        cp = _cpu()
+        broken = sorted(m for m in probe if not _probe_import(m))
+        if broken:
+            seen = set(broken)
+            broken += [m for m in sweep if m not in seen and not _probe_import(m)]
+        stats["broken"] = broken
+        stats["probe_cpu"] = round(_cpu() - cp, 3)
     filter_pair = _install_case_filter(case_filter)
     stats["case_filter"] = {f: len(k) for f, k in (case_filter or {}).items()} or None
 
