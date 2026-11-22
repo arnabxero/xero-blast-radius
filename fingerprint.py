@@ -33,6 +33,8 @@ _FUNC_TYPES = (types.FunctionType, types.BuiltinFunctionType, types.MethodType, 
 _LOG_TYPES = (logging.Logger, logging.LoggerAdapter, logging.Handler, logging.Filter)
 _THREAD_MODS = ("threading", "_thread", "weakref", "_weakref", "_weakrefset")
 _KIND: dict = {}  # type -> which leaf rule applies to its instances (0: none)
+_MEMO: dict = {}  # (id, depth) -> (object, string) for subtrees with no cycle marker
+_CYC = [0]
 _LEAF: dict = {}  # id -> (object, string) for enum members and classes (the object is held, so its id stays unique)
 
 
@@ -97,9 +99,31 @@ def _fp(v, depth: int, seen: set) -> str:
     if depth <= 0:
         return f"T:{t.__qualname__}"
     vid = id(v)
+    hit = _MEMO.get((vid, depth))
+    if hit is not None and hit[0] is v:
+        return hit[1]
     if vid in seen:
+        _CYC[0] += 1
         return "@cycle"
     seen.add(vid)
+    c0 = _CYC[0]
+    r = _expand(v, t, depth, seen, vid)
+    if _CYC[0] == c0:
+        _MEMO[(vid, depth)] = (v, r)
+    return r
+
+
+def _is_trie(v: dict) -> bool:
+    has_char = False
+    for k, x in v.items():
+        if type(k) is str and len(k) == 1 and type(x) is dict:
+            has_char = True
+        elif not (type(k) is int and k == 0):
+            return False
+    return has_char
+
+
+def _expand(v, t, depth: int, seen: set, vid: int) -> str:
     try:
         if isinstance(v, (types.FunctionType,)):
             parts = [f"F:{v.__module__}.{v.__qualname__}"]
@@ -131,7 +155,13 @@ def _fp(v, depth: int, seen: set) -> str:
         if isinstance(v, functools.partial):
             return "Pa(" + _fp(v.func, depth - 1, seen) + _fp(v.args, depth - 1, seen) + _fp(v.keywords, depth - 1, seen) + ")"
         if isinstance(v, dict):
-            items = sorted(_fp(k, depth - 1, seen) + "=" + _fp(x, depth - 1, seen) for k, x in v.items())
+            # A trie node (sqlglot.trie: one character per level, 0 marks a
+            # complete key) passes its own depth to its children, so a key of
+            # any length is seen. A new multi-word keyword that extends an
+            # existing one ("PARTITION BY RANGE") changes how every text
+            # starting with the shorter one is scanned.
+            dd = depth if _is_trie(v) else depth - 1
+            items = sorted(_fp(k, depth - 1, seen) + "=" + _fp(x, dd, seen) for k, x in v.items())
             return f"D{t.__name__}{{" + ",".join(items) + "}"
         if isinstance(v, (list, tuple)):
             parts = [_fp(x, depth - 1, seen) for x in v]

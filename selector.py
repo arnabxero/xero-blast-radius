@@ -24,10 +24,12 @@ no table from patches or kinds of edit to failing tests.
 
 from __future__ import annotations
 
+import gc
 import gzip
 import itertools
 import json
 import os
+import select
 import signal
 import sys
 import time
@@ -51,11 +53,17 @@ SNAP_OVH = float(os.environ.get("BR_SNAP_OVH", "1.2"))
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"
 # prior chance that a candidate test actually fails, by why it is a candidate
 P_DATA = float(os.environ.get("BR_P_DATA", "0.9"))
-P_CODE = float(os.environ.get("BR_P_CODE", "0.35"))
-P_ATTR = float(os.environ.get("BR_P_ATTR", "0.35"))
+P_CODE = float(os.environ.get("BR_P_CODE", "0.2"))
+P_ATTR = float(os.environ.get("BR_P_ATTR", "0.2"))
 P_TEST = float(os.environ.get("BR_P_TEST", "0.5"))
 P_LOW = 0.05
 DEBUG = os.environ.get("BR_DEBUG", "0") == "1"
+PRELOAD = os.environ.get("BR_PRELOAD", "1") == "1"
+# rows TestExecutor's class set-up parses from the TPC tables, stored at build time (xsetup.py)
+XCACHE = os.environ.get("BR_XCACHE", os.path.join(APP, "xcache.bin"))
+XFAST = os.environ.get("BR_XFAST", "1") == "1" and os.path.exists(XCACHE)
+FARM: list = [None]  # a child's patched tree
+HOT_NAMES: set = set()  # in a child: dialects whose own files the patch changes
 
 for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_v, "1")
@@ -97,7 +105,7 @@ if os.path.exists(_BIN):
     import marshal
 
     with open(_BIN, "rb") as fh:
-        M = marshal.load(fh)
+        M = marshal.loads(fh.read())  # one read: marshal.load(fh) reads in small pieces, ~7x slower
 else:
     with gzip.open(MAPS, "rt") as fh:
         M = json.load(fh)
@@ -109,6 +117,19 @@ _IDENTITY = all(_local2num[i] == i for i in range(len(_local2num)))
 
 
 import array as _array
+
+
+def _side_map(name: str):
+    """A map beside maps.json.gz: its marshal copy (prep.py) when the image
+    has one, else the gzipped JSON. Same content either way."""
+    base = os.path.join(os.path.dirname(MAPS), name)
+    if os.path.exists(base + ".bin"):
+        import marshal
+
+        with open(base + ".bin", "rb") as fh:
+            return marshal.loads(fh.read())
+    with gzip.open(base + ".json.gz", "rt") as fh:
+        return json.load(fh)
 
 
 def _u16(b):
@@ -278,8 +299,27 @@ def vcost(n: int) -> float:
     return max(0.0, c - CLASS_SETUP.get(_cls(n), 0.0)) + 0.002
 
 
+# With xcache.bin, TestExecutor's class set-up loads stored rows instead of
+# parsing the TPC tables (xsetup.py): a small part of the measured cost. Used
+# for a commit only when the child will take that path (XS_ON, xs_files_ok).
+XS_CLS = "tests/test_executor.py::TestExecutor"
+XS_FRAC = float(os.environ.get("BR_XS_FRAC", "0.15"))
+XS_ON: list = [False]
+NO_VERIFY: list = [False]  # set per commit before choose_verify (Plan.no_verify)
+
+
+def xs_files_ok(files) -> bool:
+    """From the patch alone: will a child use the stored TPC rows?"""
+    import xsetup
+
+    return XFAST and xsetup.plan_ok(files)
+
+
 def setup_cost(n: int) -> float:
-    return CLASS_SETUP.get(_cls(n), 0.0) if n in VCPU else 0.0
+    c = CLASS_SETUP.get(_cls(n), 0.0) if n in VCPU else 0.0
+    if XS_ON[0] and _cls(n) == XS_CLS:
+        c *= XS_FRAC
+    return c
 LK_BY_ATTR: dict[str, list[str]] = {}
 for k in LK:
     cls, _, attr = k.rpartition("|")
@@ -327,14 +367,41 @@ SPLIT_IDS = (
 )
 SPLIT_NUMS = {NUM_BY_ID[t]: t for t in SPLIT_IDS if t in NUM_BY_ID}
 _SPLIT = None
+_REG = None
+
+
+def reg_tests(rel: str, ch) -> set:
+    """Tests that run a changed line only when the dialect registry is empty.
+    tests/test_dialect_entry_points.py clears Dialect._classes in setUp and
+    tearDown, so a test pytest runs after it in the same process looks its
+    dialects up again through _try_load. maps/regcov.json.gz (tracer.py with
+    TRACE_CLEARREG=1, minus the plain trace) lists, per line, the tests that
+    run it only then. A child runs a test from a full registry, so these are
+    kept, not verified."""
+    global _REG
+    if _REG is None:
+        try:
+            _REG = _side_map("regcov")
+        except OSError:
+            _REG = {}
+    fm = _REG.get(rel)
+    if not fm:
+        return set()
+    lines = set(ch.runtime_lines)
+    spans = [(first, last) for _q, first, last in ch.def_changes]
+    out: set = set()
+    for ln, nums in fm.items():
+        li = int(ln)
+        if li in lines or any(first <= abs(li) <= last for first, last in spans):
+            out.update(nums)
+    return out
 
 
 def split_maps() -> dict:
     global _SPLIT
     if _SPLIT is None:
         try:
-            with gzip.open(os.path.join(os.path.dirname(MAPS), "split.json.gz"), "rt") as fh:
-                _SPLIT = json.load(fh)
+            _SPLIT = _side_map("split")
         except Exception:  # noqa: BLE001
             _SPLIT = {}
     return _SPLIT
@@ -347,8 +414,7 @@ def fe_maps() -> dict:
     global _FE
     if _FE is None:
         try:
-            with gzip.open(os.path.join(os.path.dirname(MAPS), "fe.json.gz"), "rt") as fh:
-                _FE = json.load(fh)
+            _FE = _side_map("fe")
             for v in _FE.values():
                 v["_exec"] = {f: set(ls) for f, ls in v["exec"].items()}
         except Exception:  # noqa: BLE001
@@ -465,8 +531,7 @@ def cf_maps() -> dict:
     global _CF
     if _CF is None:
         try:
-            with gzip.open(os.path.join(os.path.dirname(MAPS), "cf.json.gz"), "rt") as fh:
-                _CF = json.load(fh)
+            _CF = _side_map("cf")
         except Exception:  # noqa: BLE001
             _CF = {}
     return _CF
@@ -474,8 +539,8 @@ def cf_maps() -> dict:
 
 def cf_pairs(n: int, plan) -> tuple | None:
     """("@cf", pair indexes, pair count, CPU cost, "run") when test n can be
-    verified on only the fixture pairs that execute a changed line (none,
-    when only its own code outside the pairs does); None to run it whole."""
+    verified on only the fixture pairs that execute a changed line; None to
+    run it whole (also when its own code outside the pairs runs one)."""
     m = CF_NUMS.get(n)
     if m is None or n in plan.cands.other:
         return None
@@ -498,9 +563,10 @@ def cf_pairs(n: int, plan) -> tuple | None:
                 return None  # setUpClass runs it
             j = lm.get(str(l))
             if j is None:
-                if l in outside:
-                    continue  # the test's own code runs it, whichever pairs run
-                return None  # the test runs it, but no traced run did
+                # The test's own code runs it outside the pairs (or no traced
+                # run did): what it builds there, such as a schema every pair
+                # is given, can change any pair's result.
+                return None
             q |= int(masks[j], 16)
     nq = t["nq"]
     if q == (1 << nq) - 1:
@@ -560,7 +626,7 @@ def choose_verify(cands: dict, already_forked: bool, split: dict | None = None) 
     passes (probability 1 - p_i). Expected schedule cost is approximated as
     P(all verified pass) * S(include) + P(some fail) * S(include + verified).
     """
-    if not VERIFY:
+    if not VERIFY or NO_VERIFY[0]:
         return [], sorted(cands)
     split = split or {}
     fixed = sorted(n for n in cands if n in NOVERIFY and n not in split)
@@ -687,6 +753,7 @@ class Plan:
         self.cid = cid
         self.cands = Cands()
         self.need_snapshot = False
+        self.no_verify = False  # keep every candidate unverified (sort removed)
         self.all_tests = False  # include everything, unverified
         self.files: dict[str, str | None] = {}  # rel path -> new text (None = deleted)
         self.py_changes: dict[str, astdiff.PyChange] = {}
@@ -848,6 +915,24 @@ def analyze(cid: str, text: str) -> Plan:
             plan.all_tests = True
             plan.notes.append(f"cannot apply {fp.path}: {e}")
             continue
+        if new_rel and new_rel.endswith(".py") and (fp.is_new or old_rel != new_rel):
+            top = new_rel[:-3] if "/" not in new_rel else (new_rel[:-12] if new_rel.endswith("/__init__.py") and new_rel.count("/") == 1 else "")
+            if top in getattr(sys, "stdlib_module_names", ()) or top in ("sitecustomize", "usercustomize"):
+                # on sys.path ahead of the standard library (or run at start-up)
+                plan.all_tests = True
+                plan.notes.append(f"new top-level module {new_rel}")
+        if (old is not None and new is not None and (new_rel or "").startswith("sqlglot/") and new_rel.endswith(".py")
+                and old.count("sorted(") + old.count(".sort(") > new.count("sorted(") + new.count(".sort(")):
+            # Output may now follow set or dict order, which the hash seed
+            # decides: a child verifies under one seed, pytest under others
+            plan.no_verify = True
+            plan.notes.append(f"sort removed in {new_rel}: no verification")
+        if ((old is not None or fp.is_new) and new is not None and (new_rel or "").startswith(("sqlglot/", "tests/"))
+                and new_rel.endswith(".py") and not plan.no_verify and _seed_order_added(old, new, fp)):
+            # a new set (or hash(), id(), random): its order or value may
+            # differ between our seed and pytest's
+            plan.no_verify = True
+            plan.notes.append(f"set/hash/id/random added in {new_rel}: no verification")
         if old_rel and new_rel and old_rel != new_rel:
             plan.files[old_rel] = None
         if new_rel:
@@ -922,6 +1007,79 @@ def test_side(rel: str, is_new: bool) -> bool:
             or b.startswith("test_") or b.endswith("_test.py"))
 
 
+_SEED_PRE = None
+
+
+_SET_METHODS = ("union", "intersection", "difference", "symmetric_difference")
+
+
+def _seed_nodes(src: str):
+    """(count, shapes): how many seed-sensitive nodes the module has (set
+    displays and comprehensions, set()/frozenset()/hash()/id() calls, uses
+    of random), and a multiset of the ones inside functions whose order or
+    value can matter, as ast.dump text: also set methods (a.union(b)) and
+    set operators on keys()/items() views, but not the right side of an
+    `in` test, where only membership counts."""
+    import ast
+    from collections import Counter
+
+    def hit(x):
+        if isinstance(x, (ast.Set, ast.SetComp)):
+            return True
+        if isinstance(x, ast.Call) and isinstance(x.func, ast.Name) and x.func.id in ("set", "frozenset", "hash", "id"):
+            return True
+        return isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "random"
+
+    def setop(x):
+        if isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute) and x.func.attr in _SET_METHODS:
+            return True
+        return (isinstance(x, ast.BinOp) and isinstance(x.op, (ast.Sub, ast.BitAnd, ast.BitOr, ast.BitXor))
+                and any(isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute) and v.func.attr in ("keys", "items")
+                        for v in (x.left, x.right)))
+
+    n = 0
+    memb = set()
+    shapes: Counter = Counter()
+    fn = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+    stack = [(ast.parse(src), False)]
+    while stack:  # one pass; a Compare comes off the stack before its operands
+        x, inf = stack.pop()
+        h = hit(x)
+        n += h
+        if isinstance(x, ast.Compare) and all(isinstance(o, (ast.In, ast.NotIn)) for o in x.ops):
+            memb.update(id(c) for c in x.comparators)
+        if inf and (h or setop(x)) and id(x) not in memb:
+            shapes[ast.dump(x)] += 1
+        inf = inf or isinstance(x, fn)
+        stack.extend((c, inf) for c in ast.iter_child_nodes(x))
+    return n, shapes
+
+
+def _seed_order_added(old: str, new: str, fp) -> bool:
+    """Whether the patch adds a set (display, comprehension, set() or
+    frozenset()), a hash() or id() call, or a use of random: iteration order
+    of a set of strings, and hash() itself, follow PYTHONHASHSEED, so a child
+    that verifies under seed 0 could pass a test that pytest fails. A quick
+    text check of the added lines first; then node counts, old against new,
+    and, so that a set removed elsewhere cannot hide one added, any new or
+    changed order-sensitive set inside a function (old is None for a new
+    file)."""
+    import re
+
+    global _SEED_PRE
+    if _SEED_PRE is None:
+        _SEED_PRE = re.compile(r"(?<![\w.])(?:set|frozenset|hash|id)\s*\(|\brandom\b|\{|\bcomprehension\b"
+                               r"|\.(?:union|intersection|difference|symmetric_difference|keys|items)\s*\(")
+    if not any(_SEED_PRE.search(l) for l in fp.added_text()):
+        return False
+    try:
+        nn, ns = _seed_nodes(new)
+        on, os_ = _seed_nodes(old) if old is not None else (0, {})
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+    return nn > on or bool(ns - os_) if old is not None else bool(ns)
+
+
 def tests_reading(rel: str, listing: bool = False) -> set:
     out: set = set()
     sid = READS.get(rel)
@@ -948,13 +1106,37 @@ def tests_reading(rel: str, listing: bool = False) -> set:
 _EXEC_CACHE: dict = {}
 
 
+def _pristine_code(rel: str, src: str | None):
+    """The module code the image compiled for the pinned file (its
+    __pycache__ entry), when src is exactly that file's text and the entry
+    is current: the same code compile() would build, without compiling."""
+    try:
+        import importlib.util
+        import marshal
+
+        if not src or read_pristine(rel) != src:
+            return None
+        path = os.path.join(PRISTINE, rel)
+        with open(importlib.util.cache_from_source(path), "rb") as fh:
+            data = fh.read()
+        if data[:4] != importlib.util.MAGIC_NUMBER or int.from_bytes(data[4:8], "little") != 0:
+            return None
+        st = os.stat(path)
+        if int.from_bytes(data[8:12], "little") != int(st.st_mtime) & 0xFFFFFFFF or int.from_bytes(data[12:16], "little") != st.st_size & 0xFFFFFFFF:
+            return None
+        return marshal.loads(data[16:])
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def exec_lines(rel: str, src: str | None) -> set:
     """Lines of the old source that carry bytecode (can fire a line event)."""
     v = _EXEC_CACHE.get(rel)
     if v is None:
         v = set()
         try:
-            stack = [compile(src or "", rel, "exec", dont_inherit=True)]
+            co = _pristine_code(rel, src)
+            stack = [co if co is not None else compile(src or "", rel, "exec", dont_inherit=True)]
             while stack:
                 co = stack.pop()
                 for _s, _e, ln in co.co_lines():
@@ -974,8 +1156,7 @@ def wm_maps() -> dict:
     global _WM
     if _WM is None:
         try:
-            with gzip.open(os.path.join(os.path.dirname(MAPS), "wm.json.gz"), "rt") as fh:
-                _WM = json.load(fh)
+            _WM = _side_map("wm")
             nums = [NUM_BY_ID.get(i) for i in _WM["tests"]]
             _WM["_nums"] = nums
             _WM["_incomplete"] = {nums[i] for i in _WM["incomplete"] if nums[i] is not None}
@@ -993,6 +1174,45 @@ def _cov_only(rel: str, lines) -> set:
         sid = fm.get(ln)
         if sid is not None:
             out.update(SETS[sid])
+    return out
+
+
+_BW = None
+
+
+def bw_maps() -> dict:
+    global _BW
+    if _BW is None:
+        try:
+            _BW = _side_map("bw")
+            nums = [NUM_BY_ID.get(i) for i in _BW["tests"]]
+            _BW["_nums"] = nums
+            _BW["_incomplete"] = {nums[i] for i in _BW["incomplete"] if nums[i] is not None}
+            _BW["_incomplete"] |= set(ALL) - {n for n in nums if n is not None}
+        except Exception:  # noqa: BLE001
+            _BW = {}
+    return _BW
+
+
+def bw_tests(rel: str, key: str, i: int, op: str, lines) -> set | None:
+    """Tests in which swapping the i-th operator of this and/or chain ever
+    changes its value (or what it evaluates), per bwtrace.py. None: no
+    profile for the chain."""
+    W = bw_maps()
+    if not W:
+        return None
+    site = W["sites"].get(rel, {}).get(key)
+    if site is None or site[0] != op or not 0 <= i < site[1] - 1:
+        return None
+    for d in W["modules"].values():  # the swap shows while a test module imports
+        if i in d.get(rel, {}).get(key, ()):
+            return None
+    out: set = set()
+    sid = site[3].get(str(i))
+    if sid is not None:
+        nums = W["_nums"]
+        out.update(nums[j] for j in W["sets"][sid] if nums[j] is not None)
+    out |= _cov_only(rel, lines) & W["_incomplete"]
     return out
 
 
@@ -1029,9 +1249,11 @@ def wm_tests(rel: str, key: str, old_op: str, new_op: str, lines) -> set | None:
 def runtime_tests(rel: str, ch: astdiff.PyChange, old_src) -> set:
     """Tests that execute a runtime difference. When no line of a difference
     can fire a line event (a bare `if (` line, `nonlocal`, ...), blame its
-    whole function instead. An operator swap counts only for the tests in
-    which the new operator would give a different result."""
+    whole function instead. An operator swap (a comparison's, or one `and`/`or`
+    of a chain) counts only for the tests in which it would give a different
+    result."""
     swaps = getattr(ch, "swaps", None) or []
+    bswaps = getattr(ch, "bswaps", None) or []
     swap_groups = set()
     out: set = set()
     for key, old_op, new_op, lines, gi in swaps:
@@ -1041,7 +1263,14 @@ def runtime_tests(rel: str, ch: astdiff.PyChange, old_src) -> set:
         else:
             out |= t
             swap_groups.add(gi)
-    out |= cov_tests(rel, ch.plain_lines if swaps else ch.runtime_lines)
+    for key, i, op, lines, gi in bswaps:
+        t = bw_tests(rel, key, i, op, lines)
+        if t is None:
+            out |= cov_tests(rel, lines)
+        else:
+            out |= t
+            swap_groups.add(gi)
+    out |= cov_tests(rel, ch.plain_lines if swaps or bswaps else ch.runtime_lines)
     fm = COV.get(rel) or {}
     for gi, (lines, first, last) in enumerate(ch.runtime_groups):
         if gi in swap_groups:
@@ -1070,8 +1299,334 @@ def sqlglot_change(plan: Plan, rel: str, ch: astdiff.PyChange, old_src=None) -> 
             plan.need_snapshot = True
     for q, first, last in ch.def_changes:
         plan.cands.add(func_span_tests(rel, first, last), P_CODE, rt=True)
+    plan.cands.add(reg_tests(rel, ch), 1.0)  # kept unverified
     if ch.import_time:
         plan.need_snapshot = True
+
+
+_MUTATORS = {"append", "extend", "insert", "pop", "popitem", "remove", "clear", "update", "setdefault",
+             "add", "discard", "sort", "reverse", "__setitem__", "__delitem__", "__setattr__", "__delattr__"}
+
+
+def _module_names(tree) -> dict:
+    """Module-level names of a test module: name -> (module, imported name or
+    None for a module), or None when the module itself binds it."""
+    import ast
+
+    out: dict = {}
+    for n in tree.body:
+        if isinstance(n, ast.Import):
+            for a in n.names:
+                out[a.asname or a.name.split(".")[0]] = (a.name if a.asname else a.name.split(".")[0], None)
+        elif isinstance(n, ast.ImportFrom) and n.module and not n.level:
+            for a in n.names:
+                out[a.asname or a.name] = (n.module, a.name)
+        elif isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            out[n.name] = None
+        elif isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            for t in n.targets if isinstance(n, ast.Assign) else [n.target]:
+                for x in ast.walk(t):
+                    if isinstance(x, ast.Name):
+                        out.setdefault(x.id, None)
+    return out
+
+
+_ISMOD: dict = {}
+
+
+def _is_module(mod: str, name) -> bool:
+    """Whether mod.name (mod itself when name is None) is a module of the
+    pristine tree: a file or package there, or a name mod binds at its top
+    level by importing one (sqlglot.exp is sqlglot.expressions)."""
+    import ast
+
+    if name is None:
+        return True
+    key = (mod, name)
+    if key in _ISMOD:
+        return _ISMOD[key]
+    _ISMOD[key] = False  # import cycles
+    base = os.path.join(PRISTINE, *mod.split("."))
+    try:
+        ls = set(os.listdir(base)) if os.path.isdir(base) else set()
+    except OSError:
+        ls = set()
+    # names compared exactly (a case-insensitive file system would match a class to its module)
+    r = name + ".py" in ls or (name in ls and os.path.isfile(os.path.join(base, name, "__init__.py")))
+    if not r:
+        pkg = os.path.isfile(os.path.join(base, "__init__.py"))
+        src = read_pristine(os.path.relpath(os.path.join(base, "__init__.py") if pkg else base + ".py", PRISTINE))
+        try:
+            body = ast.parse(src).body if src else []
+        except (SyntaxError, ValueError, RecursionError):
+            body = []
+        for n in body:
+            if isinstance(n, ast.Import):
+                r = r or any((a.asname or a.name.split(".")[0]) == name for a in n.names)
+            elif isinstance(n, ast.ImportFrom):
+                if n.level:
+                    parts = mod.split(".") if pkg else mod.split(".")[:-1]
+                    parts = parts[:len(parts) - (n.level - 1)] if n.level > 1 else parts
+                    src_mod = ".".join(parts + ([n.module] if n.module else []))
+                else:
+                    src_mod = n.module
+                for a in n.names:
+                    if (a.asname or a.name) == name and src_mod:
+                        r = r or _is_module(src_mod, a.name)
+    _ISMOD[key] = r
+    return r
+
+
+def _module_object(e, modnames: dict, local: set) -> bool:
+    """Whether e (Name or Attribute chain) names a module, as in exp.update(...)
+    or sqlglot.expressions.update(...): a call of a module's function, not a
+    mutation of a container."""
+    import ast
+
+    attrs = []
+    while isinstance(e, ast.Attribute):
+        attrs.append(e.attr)
+        e = e.value
+    if not isinstance(e, ast.Name) or e.id in local:
+        return False
+    v = modnames.get(e.id)
+    if not v:
+        return False
+    mod, name = v
+    for a in [name] + attrs[::-1] if name is not None else attrs[::-1]:
+        if not _is_module(mod, a):
+            return False
+        mod = f"{mod}.{a}"
+    return True
+
+
+def _state_writes(node, modnames: dict) -> set:
+    """What node (a function or a module/class-level statement of a test
+    module) writes outside itself: (root, attribute chain) for assignments,
+    deletes, mutating calls, setattr and delattr through a module-level name
+    (or cls); ("<global>", name) for a global it rebinds."""
+    import ast
+
+    local: set = set()
+    glob: set = set()
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        a = node.args
+        local |= {x.arg for x in a.posonlyargs + a.args + a.kwonlyargs}
+        local |= {x.arg for x in (a.vararg, a.kwarg) if x is not None}
+        glob = {g for x in ast.walk(node) if isinstance(x, (ast.Global, ast.Nonlocal)) for g in x.names}
+        for x in ast.walk(node):
+            if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store):
+                local.add(x.id)
+            elif isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and x is not node:
+                local.add(x.name)
+        # (names a local import binds stay shared: they are the modules and
+        # classes themselves, and leak_tests maps them like module-level imports)
+        local -= glob
+    out: set = set()
+
+    def chain_of(e):
+        attrs = []
+        while True:
+            if isinstance(e, ast.Attribute):
+                attrs.append(e.attr)
+                e = e.value
+            elif isinstance(e, ast.Subscript):
+                e = e.value
+            elif isinstance(e, ast.Call):
+                e = e.func
+            else:
+                break
+        return (e.id if isinstance(e, ast.Name) else None), tuple(reversed(attrs))
+
+    def note(e, extra=(), container=False):
+        r, attrs = chain_of(e)
+        attrs = attrs + tuple(extra)
+        if r is None:
+            return
+        if r in local and r != "cls" or (r != "cls" and r not in modnames and r not in glob):
+            # through a local object: a container reached by attribute may be a
+            # class attribute shared by every instance (parser.FUNCTIONS[k] = v)
+            if container and attrs and attrs[-1] in LK_BY_ATTR:
+                out.add(("<any>", attrs[-1:]))
+            return
+        out.add((r, attrs))
+
+    def targets(t):
+        if isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                yield from targets(e)
+        elif isinstance(t, ast.Starred):
+            yield from targets(t.value)
+        else:
+            yield t
+
+    for x in ast.walk(node):
+        ts = []
+        if isinstance(x, (ast.Assign, ast.Delete)):
+            ts = x.targets
+        elif isinstance(x, (ast.AugAssign, ast.AnnAssign)):
+            ts = [x.target]
+        for t in ts:
+            for e in targets(t):
+                if isinstance(e, (ast.Attribute, ast.Subscript)):
+                    note(e, container=isinstance(e, ast.Subscript))
+                elif isinstance(e, ast.Name) and e.id in glob:
+                    out.add(("<global>", (e.id,)))
+        if isinstance(x, ast.Call):
+            f = x.func
+            if isinstance(f, ast.Attribute) and f.attr in _MUTATORS and not _module_object(f.value, modnames, local - glob):
+                note(f.value, container=True)
+            elif isinstance(f, ast.Name) and f.id in ("setattr", "delattr") and x.args:
+                a1 = x.args[1] if len(x.args) > 1 else None
+                name = a1.value if isinstance(a1, ast.Constant) and isinstance(a1.value, str) else "*"
+                note(x.args[0], (name,))
+    return out
+
+
+def _changed_units(old_src: str, new_src: str):
+    """Functions (at any depth, by qualname) and module- or class-level
+    statements whose text differs between the two versions of a test module,
+    from both sides. None when either side does not parse."""
+    import ast
+
+    def units(src):
+        tree = ast.parse(src)
+        out: dict = {}
+
+        def walk(body, prefix):
+            for i, n in enumerate(body):
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    out[prefix + n.name] = n
+                    walk(n.body, prefix + n.name + ".")
+                elif isinstance(n, ast.ClassDef):
+                    walk(n.body, prefix + n.name + ".")
+                else:
+                    out[f"{prefix}#{ast.dump(n)}"] = n
+        walk(tree.body, "")
+        return tree, out
+
+    try:
+        ot, ou = units(old_src)
+        nt, nu = units(new_src)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    changed = []
+    for k in set(ou) | set(nu):
+        a, b = ou.get(k), nu.get(k)
+        if a is None or b is None or ast.dump(a) != ast.dump(b):
+            changed += [x for x in (a, b) if x is not None]
+    return ot, nt, changed
+
+
+_CLS_BY_FP: dict | None = None
+
+
+def _class_attr_classes(pristine: dict, key: str, name: str) -> list:
+    """The pristine classes that class key holds as attribute name, looked up
+    through its MRO: a nested class, or one bound by assignment (Generator =
+    SnowflakeGenerator), whose value fingerprint is that of the class itself."""
+    global _CLS_BY_FP
+    classes = pristine["classes"]
+    if _CLS_BY_FP is None:
+        import hashlib
+
+        _CLS_BY_FP = {}
+        for k in classes:
+            m, _, q = k.partition(":")
+            h = hashlib.blake2b(f"C:{m}.{q}".encode("utf-8", "surrogatepass"), digest_size=8).hexdigest()
+            _CLS_BY_FP.setdefault(h, []).append(k)
+    for k in [key] + list(pristine.get("bases", {}).get(key, [])):
+        if f"{k}.{name}" in classes:
+            return [f"{k}.{name}"]
+        v = classes.get(k, {}).get(name)
+        if v is not None:
+            return list(_CLS_BY_FP.get(v, [])) if isinstance(v, str) else []
+    return []
+
+
+def leak_tests(rel: str, old_src, new_src) -> set | None:
+    """A test-module edit that writes state outside the test (BigQuery.X = ...
+    in a finally block, Parser.FUNCTIONS.pop(...), setattr(...)) can leave it
+    changed for every later test in the same process, which a test run on its
+    own never shows. The tests that read that state (they must, to see it),
+    kept unverified; everything when the state cannot be traced to readers;
+    None when the edited code writes nothing outside itself."""
+    import ast
+
+    if old_src is None or new_src is None:
+        return None
+    r = _changed_units(old_src, new_src)
+    if r is None:
+        return None
+    ot, nt, changed = r
+    names = {**_module_names(ot), **_module_names(nt)}
+    for u in changed:  # imports inside the edited code bind the same shared objects
+        for x in ast.walk(u):
+            if isinstance(x, ast.Import):
+                for a in x.names:
+                    names.setdefault(a.asname or a.name.split(".")[0], (a.name if a.asname else a.name.split(".")[0], None))
+            elif isinstance(x, ast.ImportFrom) and x.module and not x.level:
+                for a in x.names:
+                    names.setdefault(a.asname or a.name, (x.module, a.name))
+    writes: set = set()
+    for u in changed:
+        writes |= _state_writes(u, names)
+    if not writes:
+        return None
+    out: set = set()
+    pristine = None
+    for root, attrs in sorted(writes):
+        if root == "<any>":
+            for x in LK_BY_ATTR.get(attrs[0], ()):
+                out.update(SETS[LK[f"{x}|{attrs[0]}"]])
+            continue
+        if root in ("cls", "<global>") or names.get(root) is None:
+            out |= set(BY_FILE.get(rel, []))  # the test module's own state
+            for imp in TEST_IMPORTERS.get(rel, []):
+                out |= set(BY_FILE.get(imp, []))
+            continue
+        mod, name = names[root]
+        if not mod.startswith("sqlglot"):
+            return set(ALL)  # state of another library (unittest, os.environ, ...)
+        if name is None:  # a module: root.attrs[0] is one of its globals
+            if not attrs:
+                return set(ALL)
+            out |= global_ref_tests(mod, attrs[0])
+            if len(attrs) == 1:
+                continue  # the global itself: its readers are the lines naming it
+            cls_name, rest = attrs[0], attrs[1:]
+        else:
+            cls_name, rest = name, attrs
+        if pristine is None:
+            pristine = pristine_snapshot()
+            sub_of = class_subtree(pristine, pristine)
+        keys = [k for k in pristine["classes"] if k.partition(":")[2] == cls_name]
+        while not keys and rest:  # a module reached by attribute (exp.Foo, sqlglot.dialects.X)
+            cls_name, rest = rest[0], rest[1:]
+            keys = [k for k in pristine["classes"] if k.partition(":")[2] == cls_name]
+        if not keys:
+            return set(ALL)
+        if not rest:
+            for k in keys:
+                m_, _, q_ = k.partition(":")
+                out |= global_ref_tests(m_, q_)
+            continue
+        while len(rest) > 1:  # through a class held by a class (Snowflake.Generator.TRANSFORMS)
+            nk = [c for k in keys for c in _class_attr_classes(pristine, k, rest[0])]
+            if not nk:
+                break
+            keys, rest = sorted(set(nk)), rest[1:]
+        attr = rest[0]
+        hit = False
+        for k in keys:
+            for x in sub_of(k):
+                sid = LK.get(f"{x}|{attr}")
+                if sid is not None:
+                    out.update(SETS[sid])
+                    hit = True
+        if not hit:
+            return set(ALL)  # a method or descriptor the trace does not record
+    return out
 
 
 def test_change(plan: Plan, rel: str, ch: astdiff.PyChange, old_src=None) -> None:
@@ -1079,8 +1634,15 @@ def test_change(plan: Plan, rel: str, ch: astdiff.PyChange, old_src=None) -> Non
         d = os.path.dirname(rel) + "/"
         plan.cands.add([n for f, ns in BY_FILE.items() if f.startswith(d) for n in ns], P_TEST)
     if ch.syntax_error or ch.import_time:
-        plan.cands.add(BY_FILE.get(rel, []), P_TEST)
+        mem = None
+        if not ch.syntax_error and old_src is not None and plan.files.get(rel):
+            mem = _test_member_changes(old_src, plan.files[rel])
+        own = _own_tests(rel, mem, old_src, plan) if mem is not None else None
+        plan.cands.add(BY_FILE.get(rel, []) if own is None else own, P_TEST)
+        only = mem[0] if mem is not None else None
         for imp in TEST_IMPORTERS.get(rel, []):
+            if only is not None and not _may_use_classes(imp, rel, only, plan):
+                continue  # it imports other names from the module, never these classes
             plan.cands.add(BY_FILE.get(imp, []), P_TEST)
         if rel not in BY_FILE and not TEST_IMPORTERS.get(rel):
             # a helper module no test file is known to import: be safe
@@ -1089,6 +1651,257 @@ def test_change(plan: Plan, rel: str, ch: astdiff.PyChange, old_src=None) -> Non
         plan.cands.add(runtime_tests(rel, ch, old_src), P_TEST)
         for q, first, last in ch.def_changes:
             plan.cands.add(func_span_tests(rel, first, last), P_TEST)
+    plan.cands.add(reg_tests(rel, ch), 1.0)  # kept unverified
+    if not ch.syntax_error and (ch.import_time or ch.runtime_lines or ch.def_changes):
+        lt = leak_tests(rel, old_src, plan.files.get(rel))
+        if lt is not None:
+            plan.cands.add(lt, 1.0)  # a leak shows only after the edited test: kept unverified
+            plan.notes.append(f"state written by edited test code in {rel}: {len(lt)} readers")
+
+
+def _has_call(nodes) -> bool:
+    import ast
+
+    return any(isinstance(n, (ast.Call, ast.Await, ast.Yield, ast.YieldFrom, ast.NamedExpr, ast.Lambda))
+               for x in nodes if x is not None for n in ast.walk(x))
+
+
+_SAFE_ANN = {"int", "str", "bool", "float", "bytes", "complex", "object", "list", "dict", "set", "tuple", "type"}
+
+
+def _deftime_ok(v, lazy_ann: bool) -> bool:
+    """Whether running the def of plain method v cannot raise: Python 3.13
+    evaluates its defaults, and its annotations unless the module defers
+    them, when the class body runs. Constants only (and builtin type names
+    as annotations)."""
+    import ast
+
+    def const(e):
+        if isinstance(e, ast.UnaryOp) and isinstance(e.op, (ast.USub, ast.UAdd)):
+            e = e.operand
+        return isinstance(e, ast.Constant)
+
+    a = v.args
+    if not all(const(d) for d in a.defaults + [k for k in a.kw_defaults if k is not None]):
+        return False
+    if lazy_ann:
+        return True
+    ann = [v.returns] + [g.annotation for g in a.posonlyargs + a.args + a.kwonlyargs]
+    ann += [a.vararg.annotation if a.vararg else None, a.kwarg.annotation if a.kwarg else None]
+    return all(e is None or isinstance(e, ast.Constant) or (isinstance(e, ast.Name) and e.id in _SAFE_ANN) for e in ann)
+
+
+def _test_member_changes(old: str, new: str):
+    """(classes, names, all_named) when the two versions of a test module
+    differ only inside top-level classes' bodies, and there only in plain
+    methods added, removed or changed: no decorators; in the old version no
+    call in a default or annotation; in the new one a def that cannot raise
+    (_deftime_ok); no other statement of the body different or calling
+    anything, and nothing evaluated while the class body runs (its other
+    statements, every method's decorators, defaults and annotations) names a
+    changed method. Defining such a method does nothing beyond the class and
+    its subclasses. classes includes the module's classes built on the
+    changed ones; names are the changed method names; all_named is False when
+    a class differs only in the order of its methods. None otherwise."""
+    import ast
+
+    try:
+        a, b = ast.parse(old), ast.parse(new)
+    except SyntaxError:
+        return None
+    if len(a.body) != len(b.body):
+        return None
+    lazy = any(isinstance(s, ast.ImportFrom) and s.module == "__future__" and any(al.name == "annotations" for al in s.names)
+               for s in b.body)
+    fn = (ast.FunctionDef, ast.AsyncFunctionDef)
+    out: set = set()
+    names: set = set()
+    all_named = True
+    for x, y in zip(a.body, b.body):
+        if ast.dump(x) == ast.dump(y):
+            continue
+        if not (isinstance(x, ast.ClassDef) and isinstance(y, ast.ClassDef) and x.name == y.name):
+            return None
+        for f in ("decorator_list", "bases", "keywords", "type_params"):
+            if [ast.dump(v) for v in getattr(x, f, []) or []] != [ast.dump(v) for v in getattr(y, f, []) or []]:
+                return None
+        rx = [ast.dump(v) for v in x.body if not isinstance(v, fn)]
+        ry = [ast.dump(v) for v in y.body if not isinstance(v, fn)]
+        if rx != ry or _has_call([v for v in y.body if not isinstance(v, fn)]):
+            return None
+        mx = [v for v in x.body if isinstance(v, fn)]
+        my = [v for v in y.body if isinstance(v, fn)]
+        dx, dy = {v.name: v for v in mx}, {v.name: v for v in my}
+        if len(dx) != len(mx) or len(dy) != len(my):
+            return None  # a name defined twice
+        changed = set()
+        for name in set(dx) | set(dy):
+            p, q = dx.get(name), dy.get(name)
+            if p is not None and q is not None and ast.dump(p) == ast.dump(q):
+                continue
+            changed.add(name)
+            for v in (p, q):
+                if v is not None and v.decorator_list:
+                    return None
+            if p is not None:
+                ann = [p.returns] + [g.annotation for g in p.args.posonlyargs + p.args.args + p.args.kwonlyargs]
+                ann += [p.args.vararg.annotation if p.args.vararg else None, p.args.kwarg.annotation if p.args.kwarg else None]
+                if _has_call(p.args.defaults + [k for k in p.args.kw_defaults if k is not None] + ann):
+                    return None
+            if q is not None and not _deftime_ok(q, lazy):
+                return None
+        for tree, ms in ((x, mx), (y, my)):  # evaluated while the class body runs
+            ev = [v for v in tree.body if not isinstance(v, fn)]
+            for v in ms:
+                ev += v.decorator_list + v.args.defaults + [k for k in v.args.kw_defaults if k is not None]
+                if not lazy or tree is x:
+                    ev += [v.returns] + [g.annotation for g in v.args.posonlyargs + v.args.args + v.args.kwonlyargs]
+                    ev += [v.args.vararg.annotation if v.args.vararg else None, v.args.kwarg.annotation if v.args.kwarg else None]
+            if any(isinstance(n, ast.Name) and n.id in changed for e in ev if e is not None for n in ast.walk(e)):
+                return None
+        if not changed:
+            all_named = False
+        names |= changed
+        out.add(x.name)
+    if not out:
+        return None
+    grew = True
+    while grew:  # and the module's own classes built on them
+        grew = False
+        for v in b.body:
+            if isinstance(v, ast.ClassDef) and v.name not in out and any(
+                    isinstance(n, ast.Name) and n.id in out for base in v.bases for n in ast.walk(base)):
+                out.add(v.name)
+                grew = True
+    import re
+
+    pat = re.compile(r"(?<![A-Za-z0-9_])(" + "|".join(re.escape(n) for n in sorted(out)) + r")(?![A-Za-z0-9_])")
+    for v in b.body:
+        if isinstance(v, ast.ClassDef) and v.name in out:
+            continue
+        if pat.search(ast.unparse(v)):
+            return None  # other module code uses one of them (an alias, a helper, a copy)
+    return out, names, all_named
+
+
+def _changed_test_classes(old: str, new: str):
+    """The classes of _test_member_changes, or None."""
+    r = _test_member_changes(old, new)
+    return None if r is None else r[0]
+
+
+_TEST_TEXTS = None
+
+
+def _named_in_other_tests(names: set, rel: str, plan) -> bool:
+    """Whether any Python file under tests/ but rel (pristine, or as the patch
+    leaves it) names one of names as a whole word other than in a `def` of
+    that name."""
+    import re
+
+    global _TEST_TEXTS
+    if _TEST_TEXTS is None:
+        _TEST_TEXTS = {}
+        root = os.path.join(PRISTINE, "tests")
+        for dp, dns, fns in os.walk(root):
+            dns[:] = [d for d in dns if d not in ("__pycache__",)]
+            for f in fns:
+                if f.endswith(".py"):
+                    r = os.path.relpath(os.path.join(dp, f), PRISTINE).replace(os.sep, "/")
+                    try:
+                        with open(os.path.join(dp, f), encoding="utf-8", errors="surrogateescape") as fh:
+                            _TEST_TEXTS[r] = fh.read()
+                    except OSError:
+                        _TEST_TEXTS[r] = None
+    pat = re.compile(r"(?<![A-Za-z0-9_])(" + "|".join(re.escape(n) for n in sorted(names)) + r")(?![A-Za-z0-9_])")
+    texts = dict(_TEST_TEXTS)
+    for f, t in plan.files.items():
+        if f.startswith("tests/") and f.endswith(".py"):
+            texts[f] = t
+    dpat = re.compile(r"\bdef\s+(" + "|".join(re.escape(n) for n in sorted(names)) + r")\s*\(")
+    for f, t in texts.items():
+        if f == rel:
+            continue
+        if t is None:
+            return True
+        if pat.search(t) and len(pat.findall(t)) != len(dpat.findall(t)):
+            return True  # a use, not just a method of the same name elsewhere
+    return False
+
+
+def _own_tests(rel: str, mem, old_src: str, plan):
+    """The tests of test module rel that a member-only change can reach (mem
+    from _test_member_changes): those of the changed classes and their
+    subclasses; and of these only the changed methods' own tests when every
+    changed name is a test method (test*) that nothing else names: in the
+    module, old or new, no use beyond its defs; in no other test file. None
+    to charge the whole file."""
+    import ast
+    import collections
+    import re
+
+    classes, names, all_named = mem
+    narrow = all_named and bool(names) and all(n.startswith("test") for n in names)
+    if narrow:
+        for src in (old_src, plan.files.get(rel)):
+            try:
+                tree = ast.parse(src)
+            except (SyntaxError, TypeError, ValueError):
+                return None
+            defs = collections.Counter(n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
+            text = ast.unparse(tree)
+            for nm in names:
+                if len(re.findall(r"(?<![A-Za-z0-9_])" + re.escape(nm) + r"(?![A-Za-z0-9_])", text)) != defs.get(nm, 0):
+                    narrow = False
+        if narrow and _named_in_other_tests(names, rel, plan):
+            narrow = False
+    out = []
+    for n in BY_FILE.get(rel, []):
+        parts = TESTS_BY_NUM_ID[n].split("::")
+        if len(parts) != 3 or (parts[1] in classes and (not narrow or parts[2] in names)):
+            out.append(n)
+    return out
+
+
+def _may_use_classes(imp: str, rel: str, names: set, plan) -> bool:
+    """Whether test file imp may reach one of the classes `names` of test
+    module rel: unless it imports rel itself, only through `from rel import
+    ...` of other names (no star, no module object), and names none of them
+    anywhere in its text."""
+    import ast
+    import re
+
+    text = plan.files[imp] if imp in plan.files else read_pristine(imp)
+    if not text:
+        return True
+    for nm in names:
+        if re.search(r"(?<![A-Za-z0-9_])" + re.escape(nm) + r"(?![A-Za-z0-9_])", text):
+            return True
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return True
+    mod = rel[:-3].replace("/", ".")
+    pkg = imp[:-3].replace("/", ".").rpartition(".")[0]
+    direct = False
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for al in n.names:
+                if al.name == mod or mod.startswith(al.name + "."):
+                    return True  # the module (or a package above it) as an object
+        elif isinstance(n, ast.ImportFrom):
+            base = n.module or ""
+            if n.level:
+                parts = pkg.split(".")
+                up = parts[: len(parts) - (n.level - 1)] if n.level > 1 else parts
+                base = ".".join(up + ([n.module] if n.module else []))
+            if base == mod:
+                direct = True
+                if any(al.name == "*" or al.name in names for al in n.names):
+                    return True
+            elif mod.startswith(base + ".") and any(al.name == "*" or mod == base + "." + al.name for al in n.names):
+                return True  # the module object through its package
+    return not direct  # reached only through another module: assume it may
 
 
 # ---------------------------------------------------- snapshot-diff candidates
@@ -1222,13 +2035,40 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
         for tf in sorted(BY_FILE):
             try:
                 importlib.import_module(tf[:-3].replace("/", "."))
+            except _Timeout:
+                raise
             except BaseException:  # noqa: BLE001
                 out.update(BY_FILE[tf])
 
     live = None
+    flows: list = []
+    dd = default_defs(plan)
     for key, attr in diff["attrs"]:
         if attr == "__doc__":
             continue  # docstrings: nothing reads them at runtime
+        if attr == "__annotations__" and _plain_class(key, pristine) is not None:
+            # class annotations (an annotated class attribute added, removed or
+            # retyped): no sqlglot module or test reads __annotations__ (no
+            # get_type_hints, inspect.get_annotations or dataclass on such a
+            # class), and the attribute's own value is a changed attr of its own
+            continue
+        if dd:
+            if live is None:
+                import fingerprint
+
+                live = dict(fingerprint.iter_classes(sorted(sys.modules), "sqlglot"))
+            c = live.get(key)
+            if c is not None and default_only_value(c.__dict__.get(attr), dd):
+                # a method whose header changed only in constant defaults:
+                # only a call can see that, every call runs its body (the
+                # parent charged those tests from coverage), and nothing reads
+                # defaults by introspection; readers through the class family
+                # are added all the same
+                sub = subtree(key)
+                for x in LK_BY_ATTR.get(attr, ()):
+                    if x in sub:
+                        out.update(SETS[LK[f"{x}|{attr}"]])
+                continue
         if fresh_member(key, attr, plan, pristine):
             continue  # a new member under a name nothing mentions
         t = dispatch_member_tests(key, attr, plan, pristine, subtree(key))
@@ -1250,29 +2090,29 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
                 sid = CLASSUSE.get(x)
                 if sid is not None:
                     out.update(SETS[sid])
+            out |= mro_moved_tests(key, sub, pristine, patched)
             continue
-        hit = False
-        for x in LK_BY_ATTR.get(attr, ()):
-            if x in sub:
-                out.update(SETS[LK[f"{x}|{attr}"]])
-                hit = True
-        # methods (unwrapped) and attributes no traced test ever read: fall back
-        # to every test that used the class family, restricted to tests that ran
-        # code of a same-named function anywhere in that family's sources.
-        meth = method_lines(key, attr, pristine, patched)
-        if meth is not None:
-            out |= meth
-        elif not hit and (attr.startswith("_") or attr not in LK_BY_ATTR):
-            # (private attributes are mostly derived caches a metaclass or a
-            # lazily built object reads before any test runs, so the trace may
-            # not have seen their readers)
-            # reads the descriptors cannot record (dunders such as __slots__,
-            # enum members, descriptors): every user of the class family
-            out |= family_tests(key, sub)
+        base = attr_reader_tests(key, attr, sub, pristine, patched)
+        if live is None:
+            import fingerprint
+
+            live = dict(fingerprint.iter_classes(sorted(sys.modules), "sqlglot"))
+        t = core_flow_tests(key, attr, plan, live)
+        if t is not None:
+            # a tokenizer setting: the tests that ran the core's reads of it,
+            # or those that read it through the class (both cover it)
+            flows.append((t, base))
+            continue
+        out |= base
+    if flows:
+        out |= cheapest_cover(out, flows)
     for mod, name in diff["globals"]:
         if name == "__doc__":
             continue
-        if mod == "sqlglot.expressions" and name == "EXPR_CLASSES" and expr_registry_grew(pristine, diff, plan):
+        if dd and mod in sys.modules and default_only_value(vars(sys.modules[mod]).get(name), dd):
+            continue  # a function (or a name bound to it) whose defaults alone changed: as above
+        if mod == "sqlglot.expressions" and name == "EXPR_CLASSES" and (
+                expr_registry_grew(pristine, diff, plan) or expr_registry_shrank(pristine, diff, plan)):
             sid = MODATTR.get(f"{mod}|__dict__")
             if sid is not None:
                 out.update(SETS[sid])
@@ -1318,6 +2158,24 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
     return out, False
 
 
+def default_defs(plan) -> set:
+    """(module, qualname) of the undecorated sqlglot defs whose headers changed
+    only in the values of constant defaults (astdiff), outside folders whose
+    tests read code objects."""
+    out = set()
+    for rel, ch in plan.py_changes.items():
+        if rel.startswith("sqlglot/") and rel.endswith(".py") and not introspected(rel):
+            for q in getattr(ch, "default_defs", None) or ():
+                out.add((module_of(rel), q))
+    return out
+
+
+def default_only_value(v, dd: set) -> bool:
+    import types
+
+    return isinstance(v, types.FunctionType) and (getattr(v, "__module__", None), getattr(v, "__qualname__", None)) in dd
+
+
 _LIVE: dict = {}
 
 
@@ -1347,16 +2205,14 @@ def _mention_sites(word: str) -> list:
     return out
 
 
-def expr_registry_grew(pristine: dict, diff: dict, plan: Plan) -> bool:
-    """Whether the change to sqlglot.expressions.EXPR_CLASSES (expression key
-    -> class) is only new keys of new classes, which no test can feel through
-    it. Its one reader is generator._build_dispatch; new keys only add
-    dispatch entries keyed by the new classes, consulted only to generate a
-    node of a new class. A test gets such a node only through another changed
-    lookup (the parser's FUNCTIONS, FUNCTION_BY_NAME, ALL_FUNCTIONS, the new
-    module names, changed code), each charged on its own. Old classes keep
-    their keys, and none is displaced by a new class with the same key."""
-    if "sqlglot/generator.py" in plan.files or "sqlglot/expressions/__init__.py" in plan.files:
+def _registry_readers_ok(plan: Plan, diff: dict) -> bool:
+    """EXPR_CLASSES is still built as at the pinned commit and read only by
+    generator._build_dispatch, whose source is the pinned one: the registry
+    module is unchanged, no class's `key` changed, every pristine mention is
+    its definition or inside _build_dispatch, and the patch names it
+    nowhere else (a changed generator.py may name it only inside an
+    unchanged _build_dispatch)."""
+    if "sqlglot/expressions/__init__.py" in plan.files:
         return False
     if any(a == "key" for _, a in diff["attrs"]):
         return False
@@ -1369,7 +2225,49 @@ def expr_registry_grew(pristine: dict, diff: dict, plan: Plan) -> bool:
         if rel == "sqlglot/expressions/__init__.py" and text.startswith(b"EXPR_CLASSES"):
             continue
         return False
-    if any(t and "EXPR_CLASSES" in t for t in plan.files.values()):
+    for rel, t in plan.files.items():
+        if not t or "EXPR_CLASSES" not in t:
+            continue
+        if rel != "sqlglot/generator.py":
+            return False
+    gen = plan.files.get("sqlglot/generator.py", "")
+    if gen is None:
+        return False
+    if gen:
+        import ast
+        import re
+
+        def seg(src):
+            try:
+                tree = ast.parse(src)
+            except SyntaxError:
+                return None
+            for n in tree.body:
+                if isinstance(n, ast.FunctionDef) and n.name == "_build_dispatch":
+                    a = min([d.lineno for d in n.decorator_list] + [n.lineno])
+                    return "\n".join(src.splitlines()[a - 1:n.end_lineno]), a, n.end_lineno
+            return None
+
+        old, new = seg(read_pristine("sqlglot/generator.py") or ""), seg(gen)
+        if old is None or new is None or old[0] != new[0]:
+            return False
+        pat = re.compile(r"(?<![A-Za-z0-9_])EXPR_CLASSES(?![A-Za-z0-9_])")
+        for i, line in enumerate(gen.splitlines(), 1):
+            if pat.search(line) and not new[1] <= i <= new[2]:
+                return False
+    return True
+
+
+def expr_registry_grew(pristine: dict, diff: dict, plan: Plan) -> bool:
+    """Whether the change to sqlglot.expressions.EXPR_CLASSES (expression key
+    -> class) is only new keys of new classes, which no test can feel through
+    it. Its one reader is generator._build_dispatch; new keys only add
+    dispatch entries keyed by the new classes, consulted only to generate a
+    node of a new class. A test gets such a node only through another changed
+    lookup (the parser's FUNCTIONS, FUNCTION_BY_NAME, ALL_FUNCTIONS, the new
+    module names, changed code), each charged on its own. Old classes keep
+    their keys, and none is displaced by a new class with the same key."""
+    if not _registry_readers_ok(plan, diff):
         return False
     try:
         from sqlglot import exp
@@ -1403,6 +2301,515 @@ def expr_registry_grew(pristine: dict, diff: dict, plan: Plan) -> bool:
     except Exception:  # noqa: BLE001
         return False
     return True
+
+
+def expr_registry_shrank(pristine: dict, diff: dict, plan: Plan) -> bool:
+    """Whether the change to sqlglot.expressions.EXPR_CLASSES is only the loss
+    of the keys of expression classes that are gone (a reverted or deleted
+    node type). Its one reader, generator._build_dispatch, then loses only
+    the entries keyed by those classes, consulted only to generate a node of
+    a gone class. A test gets such a node only through the class or its name
+    (charged by the class's own entry and the module globals that bound it)
+    or through another changed lookup (the parser's tables, changed code),
+    each charged on its own. Every class left keeps its key (no `key`
+    attribute changed), and none of them has the key of a gone class: with
+    the gone class no longer last in the comprehension, it would take over
+    that entry."""
+    if not _registry_readers_ok(plan, diff):
+        return False
+    try:
+        from sqlglot import exp
+        import fingerprint
+    except Exception:  # noqa: BLE001
+        return False
+    if not _LIVE:
+        _LIVE.update(dict(fingerprint.iter_classes(sorted(sys.modules), "sqlglot")))
+    pcl = pristine.get("classes") or {}
+    rev = {id(v): k for k, v in _LIVE.items()}
+    reg = getattr(exp, "EXPR_CLASSES", None)
+    if not isinstance(reg, dict):
+        return False
+    for k, c in reg.items():
+        fk = rev.get(id(c))
+        if fk is None or fk not in pcl:
+            return False  # a new class (or one that moved): not only a loss
+    gone = [fk for fk in pcl if fk.startswith("sqlglot.expressions") and fk not in _LIVE]
+    if not gone:
+        return False
+    gone_keys = set()
+    for fk in gone:
+        gk = (pcl.get(fk) or {}).get("key")
+        if gk is None:
+            return False
+        gone_keys.add(gk)
+    try:
+        if any(fingerprint.fp(k) in gone_keys for k in reg):
+            return False  # a class left now holds a gone class's key
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+# ------------------------------------------------- tokenizer settings flow
+# Tokenizer._init_core hands every tokenizer setting to a new TokenizerCore
+# each time a tokenizer is built, so every test that tokenizes reads every
+# setting through the class, and the attribute-read trace cannot tell which
+# tests use which. What a setting does is decided where the core reads the
+# field it was handed (`self.byte_string_escapes` in a byte-string branch,
+# say). A setting whose only by-name reads are that hand-off, class bodies
+# and class-creation hooks (whose results land on classes, which the
+# snapshot compares) is charged to the tests that ran the core's reads of
+# its field, the hook lines they ran, and the test files that name it.
+_TOK_REL = "sqlglot/tokens.py"
+_CORE_REL = "sqlglot/tokenizer_core.py"
+_MENTIONS: dict = {}
+_FLOW: dict = {}
+
+
+def _mentions_cached(word: str) -> list:
+    if word not in _MENTIONS:
+        _MENTIONS[word] = _mention_sites(word)
+    return _MENTIONS[word]
+
+
+def _flow_kinds(src: str, word: str, lines) -> dict | None:
+    """line -> kind for each given line of src that mentions word:
+    ("transfer", field) for the keyword argument field=self.word (or
+    bool(self.word)) of the TokenizerCore(...) call in Tokenizer._init_core,
+    "hook" in a class-creation hook (__init_subclass__, a metaclass's
+    __new__/__init__), "class" in a class body, "comment". None when any
+    line is anything else (code that runs at test time, module level, a def
+    header, a class created inside a function)."""
+    import ast
+
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+    text = src.split("\n")
+    spans: list = []
+
+    def walk(body, chain):
+        for st in body:
+            spans.append((st.lineno, st.end_lineno or st.lineno, st, chain))
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                walk(st.body, chain + (st,))
+                continue
+            for f in ("body", "orelse", "finalbody"):
+                walk(getattr(st, f, None) or [], chain)
+            for h in getattr(st, "handlers", None) or []:
+                walk(h.body, chain)
+            for c in getattr(st, "cases", None) or []:
+                walk(c.body, chain)
+
+    walk(tree.body, ())
+    FN = (ast.FunctionDef, ast.AsyncFunctionDef)
+    out: dict = {}
+    for ln in lines:
+        if 0 < ln <= len(text) and text[ln - 1].strip().startswith("#"):
+            out[ln] = "comment"
+            continue
+        inner = None
+        for first, last, st, chain in spans:
+            if first <= ln <= last and (inner is None or (first >= inner[0] and last <= inner[1])):
+                inner = (first, last, st, chain)
+        if inner is None:
+            return None
+        _f, _l, st, chain = inner
+        if isinstance(st, (*FN, ast.ClassDef)):
+            return None  # a header: decorators, defaults, bases
+        if not chain:
+            return None  # module level
+        # the statement's own lines (a compound statement: its header)
+        hdr = st.end_lineno or st.lineno
+        if isinstance(st, (ast.If, ast.While)):
+            hdr = st.test.end_lineno or st.lineno
+        elif isinstance(st, (ast.For, ast.AsyncFor)):
+            hdr = max(st.iter.end_lineno or st.lineno, st.target.end_lineno or st.lineno)
+        elif isinstance(st, (ast.With, ast.AsyncWith)):
+            hdr = max((it.context_expr.end_lineno or st.lineno) for it in st.items)
+        elif isinstance(st, ast.Match):
+            hdr = st.subject.end_lineno or st.lineno
+        elif isinstance(st, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+            hdr = st.lineno
+        read = ("read", st.lineno, hdr)
+        if isinstance(chain[-1], ast.ClassDef):
+            if any(isinstance(c, FN) for c in chain):
+                out[ln] = read  # a class body run when its function runs
+                continue
+            out[ln] = "class"
+            continue
+        fn = chain[-1]
+        owner = chain[-2] if len(chain) >= 2 else None
+        if not isinstance(owner, ast.ClassDef) or any(isinstance(c, FN) for c in chain[:-1]):
+            out[ln] = read  # code that runs when its function is called
+            continue
+        if fn.name == "__init_subclass__" or (
+            fn.name in ("__new__", "__init__") and any(isinstance(b, ast.Name) and b.id == "type" for b in owner.bases)
+        ):
+            out[ln] = "hook"
+            continue
+        if fn.name == "_init_core" and owner.name == "Tokenizer" and len(chain) == 2:
+            field = None
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "TokenizerCore":
+                    for kw in node.keywords:
+                        v = kw.value
+                        if isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "bool" and len(v.args) == 1 and not v.keywords:
+                            v = v.args[0]
+                        if (
+                            kw.arg
+                            and isinstance(v, ast.Attribute)
+                            and isinstance(v.value, ast.Name)
+                            and v.value.id == "self"
+                            and v.attr == word
+                            and kw.value.lineno <= ln <= (kw.value.end_lineno or kw.value.lineno)
+                        ):
+                            field = kw.arg
+            if field:
+                out[ln] = ("transfer", field)
+                continue
+        out[ln] = read  # a method that runs at test time
+    return out
+
+
+def _core_field_uses(src: str, field: str) -> set | None:
+    """Lines of TokenizerCore that load self.<field>; None when the field is
+    written any other way than one plain store `self.field = field` in
+    __init__, read off anything but self, or named as a string outside
+    __slots__. (Locals, parameters and keyword arguments that share its name
+    hold only what such a load gave them.)"""
+    import ast
+
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+    cores = [c for c in tree.body if isinstance(c, ast.ClassDef) and c.name == "TokenizerCore"]
+    if len(cores) != 1:
+        return None
+    core = cores[0]
+    uses: set = set()
+    stores = 0
+
+    def visit(node, where):
+        nonlocal stores
+        if isinstance(node, ast.Attribute) and node.attr == field:
+            if not (where in ("method", "init", "nested") and isinstance(node.value, ast.Name) and node.value.id == "self"):
+                return False
+            if isinstance(node.ctx, ast.Load):
+                uses.update(range(node.lineno, (node.end_lineno or node.lineno) + 1))
+            elif not (isinstance(node.ctx, ast.Store) and where == "init"):
+                return False
+        elif isinstance(node, ast.Constant) and node.value == field:
+            if where != "slots":
+                return False
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == field:
+            return False
+        elif isinstance(node, ast.alias) and field in (node.name, node.asname):
+            return False
+        elif isinstance(node, (ast.Global, ast.Nonlocal)) and field in node.names:
+            return False
+        if isinstance(node, (ast.AugAssign, ast.AnnAssign)) and isinstance(node.target, ast.Attribute) and node.target.attr == field:
+            return False
+        if isinstance(node, ast.Assign) and where == "init":
+            t = node.targets
+            if any(isinstance(x, ast.Attribute) and x.attr == field for x in t):
+                if not (
+                    len(t) == 1
+                    and isinstance(t[0], ast.Attribute)
+                    and isinstance(t[0].value, ast.Name)
+                    and t[0].value.id == "self"
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == field
+                ):
+                    return False
+                stores += 1
+        for ch in ast.iter_child_nodes(node):
+            w = where
+            if node is core:
+                if isinstance(ch, ast.Assign) and any(isinstance(x, ast.Name) and x.id == "__slots__" for x in ch.targets):
+                    w = "slots"
+                elif isinstance(ch, ast.FunctionDef):
+                    w = "init" if ch.name == "__init__" else "method"
+                else:
+                    w = "core"
+            elif isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)) and where in ("init", "method"):
+                w = "nested"  # a closure or nested class could keep the value
+            if visit(ch, w) is False:
+                return False
+        return True
+
+    if visit(tree, "module") is False or stores != 1:
+        return None
+    return uses
+
+
+def _reads_member(src, word: str) -> bool:
+    """Whether src may read a member called word: an attribute access
+    `.word`, or the string "word" (getattr, __slots__ walks). True when it
+    cannot be parsed."""
+    import ast
+
+    if src is None:
+        return True
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return True
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == word:
+            return True
+        if isinstance(node, ast.Constant) and node.value == word:
+            return True
+    return False
+
+
+def core_flow_tests(key: str, attr: str, plan: Plan, live: dict) -> set | None:
+    """Tests a change to the tokenizer setting key.attr can reach, by where
+    its value flows (see above); None when the rule does not apply."""
+    try:
+        tok = sys.modules.get("sqlglot.tokens")
+        c = live.get(key)
+        if tok is None or c is None or not (isinstance(c, type) and issubclass(c, tok.Tokenizer)):
+            return None
+        if attr.startswith("__") or _CORE_REL in plan.files:
+            return None
+        ck = (plan.cid, attr)
+        if ck in _FLOW:
+            return _FLOW[ck]
+        _FLOW[ck] = None
+        out: set = set()
+        fields: set = set()
+        hook_lines: dict = {}
+        sites = _mentions_cached(attr)
+        by_rel: dict = {}
+        for rel, ln, _t in sites:
+            if rel is None:
+                return None
+            by_rel.setdefault(rel, []).append(ln)
+        for rel, lines in by_rel.items():
+            if rel.startswith("tests/"):
+                out.update(BY_FILE.get(rel, ()))
+                for imp in TEST_IMPORTERS.get(rel, []):
+                    out.update(BY_FILE.get(imp, ()))
+                continue
+            if not (rel.startswith("sqlglot/") and rel.endswith(".py")):
+                return None
+            src = read_pristine(rel)
+            kinds = _flow_kinds(src, attr, lines) if src is not None else None
+            if kinds is None:
+                return None
+            imp_rel = set(IMPORT_LINES.get(rel, ()))
+            for ln, k in kinds.items():
+                if isinstance(k, tuple) and k[0] == "transfer":
+                    if rel != _TOK_REL:
+                        return None
+                    fields.add(k[1])
+                elif isinstance(k, tuple):  # ("read", first, last): runs at test time
+                    span = range(k[1], k[2] + 1)
+                    if any(x in imp_rel for x in span):
+                        return None  # also while sqlglot imports: what it built may persist
+                    hook_lines.setdefault(rel, []).extend(span)
+                elif k == "hook":
+                    hook_lines.setdefault(rel, []).append(ln)
+        import re
+
+        def lines_of(text, word):
+            pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(word) + r"(?![A-Za-z0-9_])")
+            return [i for i, s in enumerate(text.split("\n"), 1) if pat.search(s)]
+
+        # the patched files may not add other kinds of reads either
+        for rel, text in plan.files.items():
+            if text is None or not rel.endswith(".py") or rel.startswith("tests/"):
+                continue
+            ls = lines_of(text, attr)
+            if not ls:
+                continue
+            if not rel.startswith("sqlglot/"):
+                return None
+            kinds = _flow_kinds(text, attr, ls)
+            if kinds is None:
+                return None
+            for k in kinds.values():
+                if isinstance(k, tuple) and k[0] == "transfer":
+                    if rel != _TOK_REL:
+                        return None
+                    fields.add(k[1])
+        core_src = read_pristine(_CORE_REL)
+        if core_src is None:
+            return None
+        imp = set(IMPORT_LINES.get(_CORE_REL, ()))
+        for field in fields:
+            uses = _core_field_uses(core_src, field)
+            if uses is None or uses & imp:
+                return None  # read some other way, or while sqlglot imports
+            # nothing else may read the field off a core: no `.field` access
+            # and no "field" string anywhere else, old or patched
+            for rel in {r for r, _l, _t in _mentions_cached(field)}:
+                if rel is None:
+                    return None
+                if rel == _CORE_REL or not rel.endswith(".py"):
+                    continue
+                if _reads_member(read_pristine(rel), field):
+                    return None
+            for rel, text in plan.files.items():
+                if text is not None and rel.endswith(".py") and lines_of(text, field) and _reads_member(text, field):
+                    return None
+            out |= cov_tests(_CORE_REL, sorted(uses))
+        for rel, ls in hook_lines.items():
+            out |= cov_tests(rel, ls)
+        _FLOW[ck] = out
+        return out
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def cheapest_cover(have: set, pairs: list) -> set:
+    """One set from each (a, b) pair, chosen so that the union with have
+    costs the fewest recorded test seconds."""
+    import itertools
+
+    def cost(sel):
+        u = set().union(*sel) - have
+        return sum(SEC.get(n, 0) for n in u)
+
+    if len(pairs) > 8:
+        opts = [[a for a, _ in pairs], [b for _, b in pairs]]
+    else:
+        opts = (list(c) for c in itertools.product(*pairs))
+    best = min(opts, key=cost)
+    return set().union(*best)
+
+
+def attr_reader_tests(key: str, attr: str, sub, pristine: dict, patched: dict) -> set:
+    """Tests that read class attribute key.attr through the class family sub."""
+    out: set = set()
+    hit = False
+    for x in LK_BY_ATTR.get(attr, ()):
+        if x in sub:
+            out.update(SETS[LK[f"{x}|{attr}"]])
+            hit = True
+    # methods (unwrapped) and attributes no traced test ever read: fall back
+    # to every test that used the class family, restricted to tests that ran
+    # code of a same-named function anywhere in that family's sources.
+    meth = method_lines(key, attr, pristine, patched)
+    if meth is not None:
+        out |= meth
+    elif not hit and (attr.startswith("_") or attr not in LK_BY_ATTR):
+        # (private attributes are mostly derived caches a metaclass or a
+        # lazily built object reads before any test runs, so the trace may
+        # not have seen their readers)
+        # reads the descriptors cannot record (dunders such as __slots__,
+        # enum members, descriptors): every user of the class family
+        out |= family_tests(key, sub)
+    return out
+
+
+_DEF_TESTS: dict = {}
+_USED_BY: dict = {}
+
+
+def _def_tests(k: str, a: str) -> set:
+    """Tests that ran the function a defined in class k's own body."""
+    r = _DEF_TESTS.get((k, a))
+    if r is None:
+        r = _DEF_TESTS[(k, a)] = _def_tests_raw(k, a)
+    return r
+
+
+def _def_tests_raw(k: str, a: str) -> set:
+    mod, _, qual = k.partition(":")
+    rel = mod.replace(".", "/") + ".py"
+    if rel not in COV:
+        rel = mod.replace(".", "/") + "/__init__.py"
+    spans = M["defs"].get(rel, {}).get(f"{qual}.{a}")
+    return func_span_tests(rel, spans[0], spans[1]) if spans else set()
+
+
+def mro_moved_tests(key: str, sub, pristine: dict, patched: dict) -> set:
+    """A class kept on both sides with a different MRO (bases reordered,
+    added or removed). For each name, the chain of classes defining it in
+    the MRO decides what a lookup on the class's instances reaches first and
+    where super() calls inside each definition go next. Where that chain
+    moved, the tests that ran a definition which lost its place as the first
+    or whose successor changed (whatever they ran it on: a superset of the
+    runs on this class). When the abstract methods left over change, every
+    instantiation: the tests that ran the __init__/__new__ it reached, and
+    every reference to the class. Readers of data attributes through the
+    class family are its CLASSUSE sets, charged by the caller. A run only
+    matters on an object of this class family, so all of it is limited to
+    the tests that used the family: its readers, the tests that ran a line
+    naming one of its classes (every construction by name), and those that
+    ran one of its own methods. An ancestor that comes or goes changes
+    isinstance() and except clauses: the tests that ran a line naming it, and
+    for one from outside sqlglot or new in the patch every test that used the
+    family, as for a name the class newly reaches through its new MRO."""
+    pc, nc = pristine["classes"], patched["classes"]
+    if key not in pc or key not in nc:
+        return set()
+    mo = [key] + pristine["bases"].get(key, [])
+    mn = [key] + patched["bases"].get(key, [])
+    out: set = set()
+    foreign = False
+    names: set = set()
+    for k in mo:
+        names |= set(pc.get(k, ()))
+    for k in mn:
+        names |= set(nc.get(k, ()))
+    for a in sorted(names):
+        co = [k for k in mo if a in pc.get(k, ())]
+        cn = [k for k in mn if a in nc.get(k, ())]
+        if co == cn:
+            continue
+        if not co:
+            # a name the class newly reaches (its pristine lookup fell through
+            # to object or failed): __eq__ from a new mixin sets __hash__ to
+            # None, __len__ changes truthiness. Every use of the class can see it
+            foreign = True
+            continue
+        for i, k in enumerate(co):
+            nxt_o = co[i + 1] if i + 1 < len(co) else None
+            j = cn.index(k) if k in cn else None
+            nxt_n = cn[j + 1] if j is not None and j + 1 < len(cn) else None
+            if (i == 0 and j != 0) or nxt_o != nxt_n:
+                out |= _def_tests(k, a)
+    # an ancestor that came or went changes isinstance() and except clauses
+    # on the class's objects: the tests that ran a line naming it, or (a class
+    # from outside sqlglot, say ValueError, whose mentions are not mapped)
+    # every test that used the family
+    for k in set(mo) ^ set(mn):
+        mod, _, qual = k.partition(":")
+        if mod.startswith("sqlglot") and "." not in qual and k in pc:
+            out |= global_ref_tests(mod, qual)
+        else:
+            foreign = True  # from outside sqlglot, nested, or new in the patch (no pristine references)
+    if pc[key].get("__abstractmethods__") != nc[key].get("__abstractmethods__"):
+        for a in ("__init__", "__new__"):
+            co = [k for k in mo if a in pc.get(k, ())]
+            if co:
+                out |= _def_tests(co[0], a)
+        mod, _, qual = key.partition(":")
+        out |= global_ref_tests(mod, qual.split(".")[0])
+    if not out and not foreign:
+        return out
+    used: set = set()
+    for x in sub:
+        u = _USED_BY.get(x)
+        if u is None:
+            u = set()
+            sid = CLASSUSE.get(x)
+            if sid is not None:
+                u.update(SETS[sid])
+            mod, _, qual = x.partition(":")
+            if "." not in qual and mod.startswith("sqlglot"):
+                u |= global_ref_tests(mod, qual)
+            for a in pc.get(x, nc.get(x, ())):
+                u |= _def_tests(x, a)
+            if x in pc:  # pristine classes only: a patched class's members vary by commit
+                _USED_BY[x] = u
+        used |= u
+    return used if foreign else out & used
 
 
 def fresh_member(key: str, attr: str, plan: Plan, pristine: dict) -> bool:
@@ -1530,6 +2937,36 @@ def _member_class(key: str, attr: str, pristine: dict):
         return None
     pc = (pristine.get("classes") or {}).get(key)
     if pc is None or attr in pc:
+        return None
+    if not _LIVE:
+        import fingerprint
+
+        _LIVE.update(dict(fingerprint.iter_classes(sorted(sys.modules), "sqlglot")))
+    cls = _LIVE.get(key)
+    if not isinstance(cls, type):
+        return None
+    import dataclasses
+    import typing
+
+    if dataclasses.is_dataclass(cls):
+        return None
+    meta = type(cls)
+    if meta is not type and not (getattr(meta, "__module__", "") or "").startswith("sqlglot"):
+        return None
+    for k in cls.__mro__:
+        if k is object or k is typing.Generic:
+            continue
+        if not (getattr(k, "__module__", "") or "").startswith("sqlglot"):
+            return None
+    return cls
+
+
+def _plain_class(key: str, pristine: dict):
+    """The live class key when its MRO is all sqlglot code (no Enum,
+    dataclass, NamedTuple, TypedDict or Protocol, no foreign metaclass) and it
+    was no dataclass at the pinned commit either; else None."""
+    pc = (pristine.get("classes") or {}).get(key)
+    if pc is None or "__dataclass_fields__" in pc:
         return None
     if not _LIVE:
         import fingerprint
@@ -1684,6 +3121,106 @@ def build_farm(cid: str, files: dict) -> str:
     return root
 
 
+def _core_modules() -> frozenset:
+    try:
+        with open(os.path.join(APP, "maps", "core.json")) as fh:
+            return frozenset(json.load(fh))
+    except Exception:  # noqa: BLE001
+        return frozenset()
+
+
+# the sqlglot modules `import sqlglot` runs at the pinned commit
+CORE = _core_modules()
+
+
+def _is_sqlglot(name: str) -> bool:
+    return name == "sqlglot" or name.startswith("sqlglot.")
+
+
+def preload_ok(plan) -> bool:
+    """May this commit's child start from the parent's pristine `import
+    sqlglot`? Only when the patch leaves alone every module that import runs
+    and every file it looks for: it may change existing sqlglot modules outside
+    that set and existing test-side files (not a package `__init__` or a
+    conftest), and it adds, deletes and renames nothing. A fresh import in the
+    child would then run exactly the code the parent ran."""
+    if not PRELOAD or not CORE or not plan.files:
+        return False
+    for rel, text in plan.files.items():
+        if text is None or not os.path.isfile(os.path.join(PRISTINE, rel)):
+            return False
+        if rel.startswith("sqlglot/"):
+            if not rel.endswith(".py") or module_of(rel) in CORE:
+                return False
+        elif not rel.startswith("tests/") or os.path.basename(rel) in ("__init__.py", "conftest.py"):
+            return False
+    return True
+
+
+def preload_core() -> bool:
+    """Import pristine sqlglot in the parent (unittest is already loaded, as
+    in a child). True when it loaded exactly CORE."""
+    before = set(sys.modules)
+    sys.path.insert(0, PRISTINE)
+    try:
+        import sqlglot  # noqa: F401
+        ok = True
+    except _ParentTimeout:
+        raise
+    except BaseException:  # noqa: BLE001
+        ok = False
+    finally:
+        if sys.path and sys.path[0] == PRISTINE:
+            del sys.path[0]
+    loaded = {m for m in set(sys.modules) - before if _is_sqlglot(m)}
+    return ok and loaded == CORE
+
+
+def purge_sqlglot() -> None:
+    for name in [m for m in sys.modules if _is_sqlglot(m)]:
+        del sys.modules[name]
+
+
+def rebase_core(root: str) -> bool:
+    """Make the preloaded modules look imported from the farm, as a fresh
+    import there would have them: their files, and above all the package
+    paths that submodules (the patched ones among them) are found through."""
+    old = os.path.join(PRISTINE, "")
+    new = os.path.join(root, "")
+
+    def fix(p):
+        if p is None:
+            return None
+        if not isinstance(p, str) or not p.startswith(old):
+            raise ValueError(p)
+        return new + p[len(old):]
+
+    try:
+        mods = [(n, m) for n, m in sys.modules.items() if _is_sqlglot(n)]
+        if {n for n, _ in mods} != CORE:
+            return False
+        plan = []
+        for _n, m in mods:
+            spec = m.__spec__
+            path = getattr(m, "__path__", None)
+            if path is not None and (not isinstance(path, list) or spec.submodule_search_locations is not path):
+                return False
+            plan.append((m, spec, fix(m.__file__), fix(getattr(m, "__cached__", None)), fix(spec.origin),
+                         fix(spec.cached), [fix(p) for p in path] if path is not None else None))
+    except Exception:  # noqa: BLE001
+        return False
+    for m, spec, file_, cached, origin, scached, path in plan:
+        m.__file__ = file_
+        m.__cached__ = cached
+        spec.origin = origin
+        spec.cached = scached
+        if path is not None:
+            m.__path__[:] = path  # the same list as spec.submodule_search_locations
+        if hasattr(m.__loader__, "path"):
+            m.__loader__.path = origin
+    return True
+
+
 class _Timeout(BaseException):
     pass
 
@@ -1695,6 +3232,29 @@ SETUP_LIMIT = float(os.environ.get("BR_SETUP_LIMIT", "15"))  # class/module set-
 def _on_alarm(*_):
     TIMED_OUT[0] = True
     raise _Timeout()
+
+
+# CPU seconds a child may spend importing the patched code (sqlglot for the
+# snapshot, test modules before verification). Normal imports take a fraction
+# of a second; a patch that loops forever where modules run code at import
+# (a parser loop reached from a module-level parse) would otherwise hold the
+# child until the parent kills it. That patch makes pytest's collection hang
+# too, so the answer is every test.
+PREP_CPU = float(os.environ.get("BR_PREP_CPU", "8"))  # test modules
+SNAP_CPU = float(os.environ.get("BR_SNAP_CPU", "5"))  # sqlglot, for the snapshot (worst seen: 1.1 s)
+HUNG = [False]
+
+
+def _on_prof(*_):
+    HUNG[0] = True
+    raise _Timeout()
+
+
+def _prep_limit(sec: float) -> None:
+    """CPU-time limit (ITIMER_PROF, apart from the tests' wall-clock alarms); 0 cancels."""
+    if sec > 0:
+        signal.signal(signal.SIGPROF, _on_prof)
+    signal.setitimer(signal.ITIMER_PROF, sec)
 
 
 def _apply_split(split: dict, tpc: bool = True) -> None:
@@ -1766,6 +3326,17 @@ def run_tests(nums: list[int], split: dict | None = None) -> tuple[set, set]:
     limits = {uid: 3.0 * SEC[n] + 1.5 for uid, n in id2num.items()}
 
     class R(unittest.TestResult):
+        # A test has failed once one of its subtests fails, so the rest of
+        # it can only cost time: with failfast, subTest() ends the test at
+        # its first failing subtest. stop() is a no-op so that failfast
+        # never ends the suite: the class's other tests still run.
+        def __init__(self):
+            super().__init__()
+            self.failfast = True
+
+        def stop(self):
+            pass
+
         def startTest(self, test):
             super().startTest(test)
             signal.setitimer(signal.ITIMER_REAL, limits.get(test.id(), 5.0))
@@ -1777,18 +3348,39 @@ def run_tests(nums: list[int], split: dict | None = None) -> tuple[set, set]:
 
     signal.signal(signal.SIGALRM, _on_alarm)
     suites = []
+    _prep_limit(PREP_CPU)
     for (mod, cls), items in by_class.items():
         suite = unittest.TestSuite()
         for n, uid in items:
             try:
                 suite.addTest(loader.loadTestsFromName(uid))
+            except _Timeout:
+                raise
             except BaseException:  # noqa: BLE001
                 failing.add(n)
         suites.append((items, suite))
+    _prep_limit(0)
+    if HUNG[0]:
+        raise _Timeout()
     _ph("load")
     import inline
 
+    # a failing test stops at its first failing pair: the pool tasks of the
+    # pairs after it never run (inline.py)
+    inline.LAZY = os.environ.get("BR_LAZYPOOL", "1") == "1"
+    if os.environ.get("BR_HOTFIRST", "1") == "1":
+        inline.HOT = frozenset(HOT_NAMES)
     inline.install()
+    if XFAST and FARM[0] and "tests.test_executor" in sys.modules:
+        # TestExecutor's set-up from the stored rows, when every file they
+        # depend on is the pinned one (xsetup.py); else the original runs
+        try:
+            import xsetup
+
+            if xsetup.install(FARM[0], PRISTINE, XCACHE) and DEBUG:
+                PROF.append(("xfast", 0, 0))
+        except Exception:  # noqa: BLE001
+            pass
     if split:
         # (a query-looping TPC test that must run whole shares the class
         # attribute, so cut no TPC query list in that case)
@@ -1874,6 +3466,8 @@ def fe_import_ok(n: int, d: dict, plan, pristine=None, patched=None) -> bool:
     for key, attr in d["attrs"]:
         if attr == "__doc__":
             continue
+        if attr == "__annotations__" and pristine is not None and _plain_class(key, pristine) is not None:
+            continue  # class annotations: read by nothing at run time (snapshot_candidates)
         if attr == "*" or attr.startswith("__"):
             return False
         mod, _, qual = key.partition(":")
@@ -1919,7 +3513,7 @@ def fe_check(vfe: dict) -> set:
         tid = SPLIT_NUMS[n]
         fe = fe_maps().get(tid) or {}
         try:
-            if tpcfp.differing(tid, idx, fe.get("arts", {})):
+            if tpcfp.differing(tid, idx, fe.get("arts", {}), fe.get("lean")):
                 failing.add(n)
         except BaseException:  # noqa: BLE001
             failing.add(n)
@@ -1948,7 +3542,7 @@ def fe_check_queries(vfe: dict) -> tuple[set, dict]:
         try:
             # a front end that hangs counts as differing
             signal.setitimer(signal.ITIMER_REAL, 5.0 + 4.0 * c)
-            D = tpcfp.differing_upto(tid, idx, fe.get("arts", {}), FE_RUN_MAX)
+            D = tpcfp.differing_upto(tid, idx, fe.get("arts", {}), FE_RUN_MAX, fe.get("lean"))
             signal.setitimer(signal.ITIMER_REAL, 0)
         except BaseException:  # noqa: BLE001
             signal.setitimer(signal.ITIMER_REAL, 0)
@@ -1967,14 +3561,86 @@ def fe_check_queries(vfe: dict) -> tuple[set, dict]:
     return failing, runs
 
 
+CHILD_MEM = int(float(os.environ.get("BR_CHILD_MEM_MB", "1300")) * (1 << 20))
+CHILD_VM = int(float(os.environ.get("BR_CHILD_VM_MB", "3000")) * (1 << 20))
+_VM0 = [0]
+
+
+def _status_kb(field: str):
+    with open("/proc/self/status") as fh:
+        return next((int(l.split()[1]) for l in fh if l.startswith(field + ":")), None)
+
+
+def cap_memory() -> None:
+    """A patch can make a test allocate without end (a loop that keeps
+    growing a list), faster than its timer fires; two children run at once
+    in a 4 GB container. A thread checks this child's resident memory every
+    10 ms and kills the child (and anything it started) once it holds
+    CHILD_MEM bytes more than at the fork: with no answer from it, the
+    parent keeps every candidate. Address space is capped too, far above
+    that, for a single allocation too big to wait for (libraries such as
+    duckdb reserve address space they never touch, so resident memory is
+    the real measure)."""
+    try:
+        import resource
+        import threading
+
+        page = os.sysconf("SC_PAGE_SIZE")
+        fd = os.open("/proc/self/statm", os.O_RDONLY)
+
+        def rss() -> int:
+            return int(os.pread(fd, 128, 0).split()[1]) * page
+
+        limit = rss() + CHILD_MEM
+        base = _status_kb("VmData")
+        if base is not None:
+            _VM0[0] = base
+            cap = base * 1024 + CHILD_VM
+            soft, hard = resource.getrlimit(resource.RLIMIT_DATA)
+            if hard != resource.RLIM_INFINITY:
+                cap = min(cap, hard)
+            resource.setrlimit(resource.RLIMIT_DATA, (cap, hard))
+
+        def watch() -> None:
+            while True:
+                time.sleep(0.01)
+                try:
+                    if rss() > limit:
+                        if os.getpgid(0) == os.getpid():  # its own group (never the parent's)
+                            os.killpg(os.getpid(), signal.SIGKILL)
+                        os.kill(os.getpid(), signal.SIGKILL)
+                except Exception:  # noqa: BLE001
+                    return
+
+        threading.Thread(target=watch, daemon=True).start()
+    except Exception:  # noqa: BLE001  (no /proc: nothing to do)
+        pass
+
+
 def child_main(plan: Plan, wfd: int) -> None:
     """Runs in a forked child. Writes one JSON object to wfd."""
     result: dict = {"cid": plan.cid}
     os.dup2(2, 1)  # tests may print: never let a child write to our stdout
+    cap_memory()
+    # importing sqlglot and fingerprinting it leave almost no cyclic garbage:
+    # no collector passes until something runs sqlglot (tests, TPC checks)
+    gc.disable()
     try:
         _ph("start")
         root = build_farm(plan.cid, plan.files)
+        FARM[0] = root
+        for _rel in plan.files:
+            _p = _rel[:-3].split("/") if _rel.endswith(".py") else []
+            if len(_p) == 3 and _p[0] == "sqlglot" and _p[1] in ("dialects", "generators", "parsers", "typing") \
+                    and _p[2] not in ("dialect", "__init__"):
+                HOT_NAMES.add(_p[2])  # a dialect's own file: its fixture pairs are checked first (inline.py)
+        pre = bool(getattr(plan, "preloaded", False)) and rebase_core(root)
+        if not pre:
+            purge_sqlglot()  # import it fresh from the farm
+        if DEBUG:
+            result["pre"] = pre
         _ph("farm")
+        _prep_limit(SNAP_CPU)
         os.chdir(root)
         sys.path.insert(0, root)
         os.environ["SKIP_INTEGRATION"] = "0"
@@ -1990,6 +3656,8 @@ def child_main(plan: Plan, wfd: int) -> None:
                 import sqlglot as _sg
 
                 lazy = len(_sg.Dialect._classes) == 1
+            except _Timeout:
+                raise
             except BaseException:  # noqa: BLE001
                 lazy = False
         if plan.need_snapshot:
@@ -2005,6 +3673,10 @@ def child_main(plan: Plan, wfd: int) -> None:
             cands.add(extra, P_ATTR)
             _ph("snap")
             result["diff"] = {"attrs": d["attrs"][:50], "globals": d["globals"][:50], "errors": d["errors"][:5], "n": len(extra)}
+        _prep_limit(0)
+        if HUNG[0]:
+            raise _Timeout()  # (in case a handler above swallowed it)
+        gc.enable()
         if everything:
             result["select"] = sorted(ALL)
             result["verified"] = 0
@@ -2031,6 +3703,8 @@ def child_main(plan: Plan, wfd: int) -> None:
                     split[n] = (sm["attr"], list(range(nq)), nq, round(0.3 + sum(fe["cpu"].values()), 3), "fe")
             if getattr(plan, "import_errors", None):
                 split = {n: v for n, v in split.items() if v[4] != "fe"}
+            XS_ON[0] = xs_files_ok(plan.files)
+            NO_VERIFY[0] = plan.no_verify
             verify, include = choose_verify(cands, True, split)
             vsplit = {n: v for n, v in split.items() if n in verify}
             vfe = {n: v for n, v in vsplit.items() if v[4] == "fe"}
@@ -2056,7 +3730,13 @@ def child_main(plan: Plan, wfd: int) -> None:
     except BaseException as e:  # noqa: BLE001
         import traceback
 
-        result["error"] = traceback.format_exc()[-1500:]
+        _prep_limit(0)
+        if HUNG[0]:
+            result["select"] = sorted(ALL)
+            result["verified"] = 0
+            result["hung"] = True
+        else:
+            result["error"] = traceback.format_exc()[-1500:]
     import resource as _r
 
     _u = _r.getrusage(_r.RUSAGE_SELF)
@@ -2065,6 +3745,11 @@ def child_main(plan: Plan, wfd: int) -> None:
     if DEBUG:
         _ph("end")
         result["prof"] = PROF
+        result["maxrss_mb"] = round(_u.ru_maxrss / 1024)
+        try:
+            result["vmdata_mb"] = round((_status_kb("VmData") - _VM0[0]) / 1024)
+        except Exception:  # noqa: BLE001
+            pass
     data = (json.dumps(result) + "\n").encode()
     while data:
         k = os.write(wfd, data)
@@ -2073,28 +3758,97 @@ def child_main(plan: Plan, wfd: int) -> None:
 
 
 # ------------------------------------------------------------------------ main
+class _ParentTimeout(BaseException):
+    pass
+
+
+def _parent_alarm(signum, frame):
+    raise _ParentTimeout()
+
+
+ANALYZE_LIMIT = float(os.environ.get("BR_ANALYZE_LIMIT", "20"))
+
+
 def main() -> None:
+    """Whatever goes wrong in this process (an error, a patch that keeps the
+    analysis busy, the batch running out of time), every commit still gets
+    exactly one line on stdout: the selection made so far, or a safe one."""
+    st: dict = {"commits": None, "plans": {}, "selections": {}, "outputs": {}, "printed": set(), "running": {}}
+    signal.signal(signal.SIGALRM, _parent_alarm)
+    try:
+        _main(st)
+    except BaseException as e:  # noqa: BLE001
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        log("parent error, printing safe selections:", repr(e)[:300])
+        for cpid in list(st["running"]):
+            for kill in (os.killpg, os.kill):
+                try:
+                    kill(cpid, signal.SIGKILL)
+                except OSError:
+                    pass
+        commits = st["commits"]
+        if commits is None:
+            commits = sorted(p[:-6] for p in os.listdir(os.path.join(DATA, "commits")) if p.endswith(".patch"))
+        for cid in commits:
+            if cid in st["printed"]:
+                continue
+            sel = st["selections"].get(cid)
+            o = st["outputs"].get(cid)
+            p = st["plans"].get(cid)
+            if sel is None and o and "select" in o and "error" not in o:
+                sel = o["select"]
+            if sel is None:
+                sel = sorted(p.cands) if p is not None and not p.need_snapshot and not p.all_tests else list(ALL)
+            try:
+                workers = schedule(sel)
+            except BaseException:  # noqa: BLE001
+                u = sorted(set(sel) & set(ALL))
+                workers = [w for w in (u[i::8] for i in range(8)) if w]
+            sys.stdout.write(json.dumps({"commit": cid, "workers": workers}) + "\n")
+            sys.stdout.flush()
+            st["printed"].add(cid)
+
+
+def _main(st: dict) -> None:
     commits = sorted(p[:-6] for p in os.listdir(os.path.join(DATA, "commits")) if p.endswith(".patch"))
+    st["commits"] = commits
     n = len(commits)
     # wall-clock limits: 3 minutes for practice (40 commits), 4.5 for the final
     # (about 60); only local benchmarks far larger than either scale them up
     scale = max(1.0, n / (40 if n <= 45 else 60)) if n > 120 else 1.0
     budget = float(os.environ.get("BR_BUDGET", 0)) or (150.0 if n <= 45 else 235.0) * scale
-    plans: dict[str, Plan] = {}
+    plans: dict[str, Plan] = st["plans"]
+    hard = float(os.environ.get("BR_HARD", 0)) or (168.0 if n <= 45 else 258.0) * scale
     for cid in commits:
         with open(os.path.join(DATA, "commits", cid + ".patch"), encoding="utf-8", errors="surrogateescape", newline="") as fh:
             text = fh.read()
+        # a patch that keeps the analysis busy gets every test, not the batch's time
+        left = hard - 20.0 - (time.time() - T0)
         try:
-            plans[cid] = analyze(cid, text)
+            if left < 0.5:
+                raise _ParentTimeout()
+            signal.setitimer(signal.ITIMER_REAL, min(ANALYZE_LIMIT, left))
+            p = analyze(cid, text)
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            plans[cid] = p
+        except _ParentTimeout:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            p = Plan(cid)
+            p.all_tests = True
+            p.notes.append("analyze timeout")
+            plans[cid] = p
         except Exception as e:  # noqa: BLE001
+            signal.setitimer(signal.ITIMER_REAL, 0)
             p = Plan(cid)
             p.all_tests = True
             p.notes.append(f"analyze error {e!r}")
             plans[cid] = p
     _ru = __import__("resource").getrusage(0)
     log(f"phase analyze cpu {_ru.ru_utime + _ru.ru_stime:.2f}")
-    selections: dict[str, list[int]] = {}
+    selections: dict[str, list[int]] = st["selections"]
     jobs = []
+    # past this the batch is out of time: main() prints what is known
+    signal.setitimer(signal.ITIMER_REAL, max(0.1, hard + 6.0 - (time.time() - T0)))
     for cid, p in plans.items():
         if UNKNOWN and (p.cands or p.need_snapshot):
             p.cands.add(UNKNOWN, P_LOW)
@@ -2110,6 +3864,8 @@ def main() -> None:
         elif not p.cands:
             selections[cid] = []
         else:
+            XS_ON[0] = xs_files_ok(p.files)
+            NO_VERIFY[0] = p.no_verify
             verify, include = choose_verify(p.cands, False, {n: v for n, v in p.split.items()})
             if not verify:
                 selections[cid] = include
@@ -2127,23 +3883,37 @@ def main() -> None:
             pass
     _ru = __import__("resource").getrusage(0)
     log(f"phase preimport cpu {_ru.ru_utime + _ru.ru_stime:.2f}")
+    # Children whose patch leaves every module `import sqlglot` runs alone can
+    # start from one pristine import in the parent instead of each importing
+    # it; they are forked after the others, so no other child inherits it.
+    # One import in the parent pays only if it saves at least two.
+    pre = {c for c in jobs if preload_ok(plans[c])}
+    if len(pre) < 2:
+        pre = set()
     # cheap first so a slow child cannot starve the rest
-    jobs.sort(key=lambda c: (plans[c].need_snapshot, sum(SEC[x] for x in plans[c].cands)))
-    running: dict[int, tuple[str, int, float]] = {}
-    outputs: dict[str, dict] = {}
+    jobs.sort(key=lambda c: (c in pre, plans[c].need_snapshot, sum(SEC[x] for x in plans[c].cands)))
+    running: dict[int, tuple[str, int, float]] = st["running"]
+    outputs: dict[str, dict] = st["outputs"]
     max_par = int(os.environ.get("BR_PAR", "2"))
+    # One child at a time while the batch is on schedule: two children on
+    # the scorer's two CPUs (often two threads of one core) each run slower,
+    # and CPU seconds are what is scored. Past PAR_AFTER seconds (children
+    # that hang or time out) it goes back to max_par at once.
+    par_after = float(os.environ.get("BR_PAR_AFTER", "30"))
     if os.environ.get("BR_GCFREEZE", "1") == "1":
-        import gc
-
         gc.collect()
         gc.freeze()  # children: no GC pass over the parent's objects (copy-on-write)
     queue = list(jobs)
     # hard wall-clock watchdog: the whole batch must finish inside the limit
-    hard = float(os.environ.get("BR_HARD", 0)) or (168.0 if n <= 45 else 258.0) * scale
     child_limit = float(os.environ.get("BR_CHILD_LIMIT", "45"))
     while queue or running:
-        while queue and len(running) < max_par and time.time() - T0 < budget:
+        while queue and len(running) < (1 if time.time() - T0 < par_after else max_par) and time.time() - T0 < budget:
             cid = queue.pop(0)
+            if cid in pre and "core" not in st:
+                st["core"] = preload_core()
+                if os.environ.get("BR_GCFREEZE", "1") == "1":
+                    gc.freeze()
+            plans[cid].preloaded = cid in pre and st.get("core", False)
             r, w = os.pipe()
             pid = os.fork()
             if pid == 0:
@@ -2180,9 +3950,15 @@ def main() -> None:
             continue
         if pid not in running:
             continue
-        cid, r, st = running.pop(pid)
+        cid, r, t_start = running.pop(pid)
+        try:
+            os.killpg(pid, signal.SIGKILL)  # whatever the child left running in its group
+        except OSError:
+            pass
         buf = b""
-        while True:
+        # the child has exited, so its answer is already in the pipe; a process
+        # it left outside its group may still hold the write end open
+        while select.select([r], [], [], 1.0)[0]:
             chunk = os.read(r, 65536)
             if not chunk:
                 break
@@ -2192,7 +3968,7 @@ def main() -> None:
             outputs[cid] = json.loads(buf.decode() or "{}")
         except Exception:  # noqa: BLE001
             outputs[cid] = {"error": "bad child output"}
-        outputs[cid]["secs"] = round(time.time() - st, 2)
+        outputs[cid]["secs"] = round(time.time() - t_start, 2)
     for cid in jobs:
         o = outputs.get(cid)
         p = plans[cid]
@@ -2202,9 +3978,12 @@ def main() -> None:
             # no answer from the child (error or out of time): fall back safely
             selections[cid] = list(ALL) if p.need_snapshot else sorted(p.cands)
             log(cid, "fallback", (o or {}).get("error", "no output")[-400:])
-    for cid in commits:
-        sel = selections.get(cid, list(ALL))
-        print(json.dumps({"commit": cid, "workers": schedule(sel)}), flush=True)
+    lines = [(cid, json.dumps({"commit": cid, "workers": schedule(selections.get(cid, list(ALL)))}) + "\n") for cid in commits]
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    for cid, line in lines:
+        sys.stdout.write(line)  # one write per line: never half a line
+        sys.stdout.flush()
+        st["printed"].add(cid)
     if DEBUG:
         for cid in commits:
             p = plans[cid]
@@ -2223,3 +4002,12 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    if os.environ.get("BR_FASTEXIT", "1") == "1":
+        # Every line is written and every child reaped: skip the interpreter's
+        # teardown (freeing every module and object, numpy, pandas and duckdb
+        # included), CPU that changes nothing in the output.
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            os._exit(0)
